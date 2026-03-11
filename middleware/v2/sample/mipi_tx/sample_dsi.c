@@ -58,6 +58,7 @@ typedef enum
 	DSI_PANEL_OTA7290B_1920,
 	DSI_PANEL_OTA7290B,
 	DSI_PANEL_ST7701,
+	DSI_PANEL_ST7701_D310T9362V1,
 	DSI_PANEL_ST7701_HD228001C31,
 	DSI_PANEL_ST7701_HD228001C31_ALT0,
 	DSI_PANEL_ST7789V,
@@ -82,6 +83,9 @@ typedef struct _inputPara_ {
 inputPara g_input_para = {
 	.panel_model = DSI_PANEL_HX8394_EVB,
 };
+
+static struct combo_dev_cfg_s g_panel_dev_cfg;
+
 static struct panel_desc_s g_panel_desc = {
 	.panel_name = "HX8394-720x1280",
 	.dev_cfg = &dev_cfg_hx8394_720x1280,
@@ -126,6 +130,7 @@ static const char* s_panel_model_type_arr[] = {
 	"OTA7290B_1920",
 	"OTA7290B",
 	"ST7701",
+	"ST7701_D310T9362V1",
 	"ST7701_HD228001C31",
 	"ST7701_HD228001C31_ALT0",
 	"ST7789V",
@@ -410,6 +415,13 @@ void SAMPLE_MIPI_SET_PANEL_DESC()
 			g_panel_desc.dsi_init_cmds = dsi_init_cmds_st7701_480x800;
 			g_panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_st7701_480x800);
 			break;
+		case DSI_PANEL_ST7701_D310T9362V1:
+			g_panel_desc.panel_name = "ST7701-D310T9362V1-480x800";
+			g_panel_desc.dev_cfg = &dev_cfg_st7701_d310t9362v1_480x800;
+			g_panel_desc.hs_timing_cfg = &hs_timing_cfg_st7701_d310t9362v1_480x800;
+			g_panel_desc.dsi_init_cmds = dsi_init_cmds_st7701_d310t9362v1_480x800;
+			g_panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_st7701_d310t9362v1_480x800);
+			break;
 		case DSI_PANEL_ST7701_HD228001C31:
 			g_panel_desc.panel_name = "ST7701-368x552";
 			g_panel_desc.dev_cfg = &dev_cfg_st7701_368x552;
@@ -509,7 +521,7 @@ void SAMPLE_MIPI_SET_PANEL_DESC()
 			g_panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_d240si31);
 			break;
 		case DSI_PANEL_HX8394_EVB:
-		default:
+	default:
 			printf("default\n");
 			g_panel_desc.panel_name = "HX8394-720x1280";
 			g_panel_desc.dev_cfg = &dev_cfg_hx8394_720x1280;
@@ -518,6 +530,10 @@ void SAMPLE_MIPI_SET_PANEL_DESC()
 			g_panel_desc.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_hx8394_720x1280);
 			break;
 	}
+
+	memcpy(&g_panel_dev_cfg, g_panel_desc.dev_cfg, sizeof(g_panel_dev_cfg));
+	g_panel_desc.dev_cfg = &g_panel_dev_cfg;
+
 	if(g_input_para.pn_swap_flag)
 	{
 		for(CVI_U32 i = 0; i < LANE_MAX_NUM; i++) {

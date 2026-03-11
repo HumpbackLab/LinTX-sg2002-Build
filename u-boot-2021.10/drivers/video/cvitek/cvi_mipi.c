@@ -154,12 +154,7 @@ int mipi_tx_set_combo_dev_cfg(const struct combo_dev_cfg_s *dev_cfg)
 		printf("dm_gpio_set_value(disp_power_ct_gpio, deassert) failed: %d", ret);
 		//return ret;
 	}
-	ret = dm_gpio_set_value(&ctrl_gpios.disp_pwm_gpio,
-				ctrl_gpios.disp_pwm_gpio.flags & GPIOD_ACTIVE_LOW ? 0 : 1);
-	if (ret < 0) {
-		printf("dm_gpio_set_value(disp_pwm_gpio, deassert) failed: %d", ret);
-		//return ret;
-	}
+	mdelay(50);
 	ret = dm_gpio_set_value(&ctrl_gpios.disp_reset_gpio,
 				ctrl_gpios.disp_reset_gpio.flags & GPIOD_ACTIVE_LOW ? 0 : 1);
 	if (ret < 0) {
@@ -173,14 +168,20 @@ int mipi_tx_set_combo_dev_cfg(const struct combo_dev_cfg_s *dev_cfg)
 		printf("dm_gpio_set_value(disp_reset_gpio, deassert) failed: %d", ret);
 		//return ret;
 	}
-	mdelay(10);
+	mdelay(5);
 	ret = dm_gpio_set_value(&ctrl_gpios.disp_reset_gpio,
 				ctrl_gpios.disp_reset_gpio.flags & GPIOD_ACTIVE_LOW ? 0 : 1);
 	if (ret < 0) {
 		printf("dm_gpio_set_value(disp_reset_gpio, deassert) failed: %d", ret);
 		//return ret;
 	}
-	mdelay(100);
+	mdelay(120);
+	ret = dm_gpio_set_value(&ctrl_gpios.disp_pwm_gpio,
+				ctrl_gpios.disp_pwm_gpio.flags & GPIOD_ACTIVE_LOW ? 0 : 1);
+	if (ret < 0) {
+		printf("dm_gpio_set_value(disp_pwm_gpio, deassert) failed: %d", ret);
+		//return ret;
+	}
 
 	return ret;
 }

@@ -214,15 +214,27 @@ static int mipi_tx_set_combo_dev_cfg(struct cvi_vip_mipi_tx_dev *tdev, struct co
 	sclr_disp_set_timing(&timing);
 	sclr_disp_tgen_enable(true);
 
-	// resx operate after LP-11.
+	/*
+	 * Some ST7701S panels, including D310T9362V1 variants, are sensitive to
+	 * the reset pulse width and the delay after panel power becomes valid.
+	 * Keep the panel powered, wait for rails to settle, then issue a full
+	 * inactive -> active -> inactive reset pulse.
+	 */
+	if (gpio_is_valid(tdev->power_ct_pin))
+		gpio_set_value(tdev->power_ct_pin, tdev->power_ct_pin_active);
+
 	if (gpio_is_valid(tdev->reset_pin)) {
+		msleep(50);
 		gpio_set_value(tdev->reset_pin, !tdev->reset_pin_active);
 		usleep_range(5 * 1000, 10 * 1000);
 		gpio_set_value(tdev->reset_pin, tdev->reset_pin_active);
-		usleep_range(5 * 1000, 10 * 1000);
+		usleep_range(10 * 1000, 15 * 1000);
 		gpio_set_value(tdev->reset_pin, !tdev->reset_pin_active);
-		msleep(100);
+		msleep(120);
 	}
+
+	if (gpio_is_valid(tdev->pwm_pin))
+		gpio_set_value(tdev->pwm_pin, tdev->pwm_pin_active);
 
 	pr_debug("lane_num(%d) preamble_on(%d) dsi_fmt(%d) bits(%d)\n", lane_num, preamble_on, dsi_fmt, bits);
 

@@ -23,6 +23,7 @@ rcS:12345:wait:/etc/init.d/rcS
 #ca::ctrlaltdel:/sbin/reboot
 
 # Stuff to do before rebooting
+stm_down:06:wait:/etc/init.d/S99adc stop
 shd0:06:wait:/etc/init.d/rcK
 shd1:06:wait:/sbin/swapoff -a
 shd2:06:wait:/bin/umount -a -r

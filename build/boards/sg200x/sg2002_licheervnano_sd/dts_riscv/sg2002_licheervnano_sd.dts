@@ -35,25 +35,27 @@
 #ifndef __UBOOT__
 	/delete-property/ reset-gpio;
 	/delete-property/ pwm-gpio;
+	/delete-property/ power-ct-gpio;
 #else
-	// for uboot
-        reset-gpio = <&porte 0 1>;
-        pwm-gpio = <&porte 2 1>;
-#endif
+	// for uboot: panel reset is wired to PWR_GPIO0, backlight/power are external
+        reset-gpio = <&porte 0 GPIO_ACTIVE_LOW>;
+        /delete-property/ pwm-gpio;
         /delete-property/ power-ct-gpio;
+#endif
 
 };
 
 &mipi_tx {
 #ifndef __UBOOT__
-	// for linux kernel
-        reset-gpio = <&porte 0 1>;
-        pwm-gpio = <&porte 2 1>;
+	// for linux kernel: panel reset is wired to PWR_GPIO0, backlight/power are external
+        reset-gpio = <&porte 0 GPIO_ACTIVE_LOW>;
+        /delete-property/ pwm-gpio;
+        /delete-property/ power-ct-gpio;
 #else
         /delete-property/ reset-gpio;
         /delete-property/ pwm-gpio;
-#endif
         /delete-property/ power-ct-gpio;
+#endif
         status = "okay";
 };
 
@@ -269,4 +271,15 @@
                 interrupts = <38 IRQ_TYPE_LEVEL_HIGH>;
                 interrupt-parent = <&plic0>;
         };
+};
+
+&ethernet0 {
+	status = "disabled";
+};
+
+/ {
+	chosen {
+		bootargs = "console=ttyS0,115200 earlycon=sbi root=/dev/mmcblk0p2 rootwait rw";
+		stdout-path = "serial0:115200n8";
+	};
 };

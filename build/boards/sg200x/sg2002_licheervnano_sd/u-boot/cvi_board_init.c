@@ -102,6 +102,20 @@ int cvi_board_init(void)
         mmio_write_32(0x03001068, 0x4); // GPIOA 18 UART1 CTS
         mmio_write_32(0x03001064, 0x4); // GPIOA 19 UART1 RTS
 
+        // read eth phy restn reg:
+        val = mmio_read_32(0x0300300C);
+        // set lowest bit to zero
+        val &= ~(1 << 0);
+        // write back to reset eth phy
+        mmio_write_32(0x0300300C, val);
+
+        // uart 3
+        mmio_write_32(0x03001124, 0x1); // PAD_ETH_TXP UART3 RX (pinmux)
+        mmio_write_32(0x0300112C, 0x1); // PAD_ETH_RXP UART3 TX (pinmux)
+
+        // uart 2
+        mmio_write_32(0x030010A4, 0x1); // PWRGPIO 0 UART2 RX
+        mmio_write_32(0x030010A8, 0x1); // PWRGPIO 1 UART2 TX
         // PWM
         //mmio_write_32(0x03001068, 0x2); // GPIOA 18 PWM 6
 

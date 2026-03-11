@@ -455,7 +455,7 @@
 		snps,tx-queues-to-use = <1>;
 		queue0 {};
 	};
-
+#if 0
 	ethernet0: ethernet@4070000 {
 		compatible = "cvitek,ethernet";
 		reg = <0x0 0x04070000 0x0 0x10000>;
@@ -479,7 +479,7 @@
 
 		phy-mode = "rmii";
 	};
-
+#endif
 	emmc:cv-emmc@4300000 {
 		compatible = "cvitek,cv181x-emmc";
 		reg = <0x0 0x4300000 0x0 0x1000>;

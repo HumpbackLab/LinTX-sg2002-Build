@@ -53,6 +53,7 @@ typedef enum {
 	DSI_PANEL_OTA7290B_1920,
 	DSI_PANEL_OTA7290B,
 	DSI_PANEL_ST7701,
+	DSI_PANEL_ST7701_HD228001C31,
 	LVDS_PANEL_LCM185X56,
 	BT_PANEL_TP2803_BT656_1280x720_25FPS_72M,
 	BT_PANEL_NVP6021_BT1120_1920x1080_25FPS_72M,
@@ -114,6 +115,7 @@ static char *s_panel_model_type_arr[] = {
 	"OTA7290B_1920",
 	"OTA7290B",
 	"ST7701",
+	"ST7701_HD228001C31",
 	"LCM185X56",
 	"TP2803_BT656_1280x720_25FPS_72M",
 	"BT_PANEL_NVP6021_BT1120_1920x1080_25FPS_72M",
@@ -407,6 +409,13 @@ void SAMPLE_SET_PANEL_DESC(void)
 		g_panel_desc.stdsicfg.hs_timing_cfg = &hs_timing_cfg_st7701_480x800;
 		g_panel_desc.stdsicfg.dsi_init_cmds = dsi_init_cmds_st7701_480x800;
 		g_panel_desc.stdsicfg.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_st7701_480x800);
+		break;
+	case DSI_PANEL_ST7701_HD228001C31:
+		g_panel_desc.panel_type = PANEL_MODE_DSI;
+		g_panel_desc.stdsicfg.dev_cfg = &dev_cfg_st7701_368x552;
+		g_panel_desc.stdsicfg.hs_timing_cfg = &hs_timing_cfg_st7701_368x552;
+		g_panel_desc.stdsicfg.dsi_init_cmds = dsi_init_cmds_st7701_368x552;
+		g_panel_desc.stdsicfg.dsi_init_cmds_size = ARRAY_SIZE(dsi_init_cmds_st7701_368x552);
 		break;
 	case DSI_PANEL_HX8399_1080P:
 		g_panel_desc.panel_type = PANEL_MODE_DSI;

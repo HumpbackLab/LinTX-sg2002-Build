@@ -1,0 +1,52 @@
+#!/bin/sh
+#
+# S99adc: Control STM32 state
+#
+
+UART_DEV="/dev/ttyS0"
+BAUD_RATE="115200"
+
+# 定义一个配置串口的函数，避免代码重复
+config_uart() {
+    if [ ! -e "$UART_DEV" ]; then
+        echo "Error: $UART_DEV not found!"
+        exit 1
+    fi
+    # 配置串口：raw模式，关闭回显，确保发送纯净数据
+    stty -F $UART_DEV $BAUD_RATE raw -echo -echoe -echok
+}
+
+case "$1" in
+  start)
+    echo "Configuring $UART_DEV and triggering STM32..."
+    config_uart
+    
+    # 稍微延时，避开系统启动时的杂乱日志（如果是Console口的话）
+    sleep 1 
+    
+    printf "start_stm" > $UART_DEV
+    echo "STM32 start signal sent."
+    ;;
+    
+  stop)
+    echo "Notifying STM32 to sleep..." > /dev/console
+    config_uart
+    
+    # --- 核心修改：发送 sleep_stm ---
+    # 这里不需要sleep太久，关机要快
+    printf "sleep_stm" > $UART_DEV
+    
+    echo "STM32 sleep signal sent." > /dev/console
+    ;;
+    
+  restart|reload)
+    "$0" stop
+    "$0" start
+    ;;
+    
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+esac
+
+exit $?

@@ -5,8 +5,6 @@
 
 #include <cvi_mipi.h>
 
-#define PANEL_NAME "NETEASE-2"
-
 #define ST7701_NETEASE_VACT	800
 #define ST7701_NETEASE_VSA		10
 #define ST7701_NETEASE_VBP		20
