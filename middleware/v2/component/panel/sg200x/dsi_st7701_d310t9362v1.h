@@ -14,17 +14,17 @@
 #endif
 
 #define ST7701_D310T9362V1_VACT		800
-#define ST7701_D310T9362V1_VSA		4
-#define ST7701_D310T9362V1_VBP		3
-#define ST7701_D310T9362V1_VFP		9
+#define ST7701_D310T9362V1_VSA		2
+#define ST7701_D310T9362V1_VBP		34
+#define ST7701_D310T9362V1_VFP		20
 
 #define ST7701_D310T9362V1_HACT		480
-#define ST7701_D310T9362V1_HSA		4
-#define ST7701_D310T9362V1_HBP		32
-#define ST7701_D310T9362V1_HFP		32
+#define ST7701_D310T9362V1_HSA		10
+#define ST7701_D310T9362V1_HBP		60
+#define ST7701_D310T9362V1_HFP		50
 
 #define ST7701_D310T9362V1_PIXEL_CLK(x) ((x##_VACT + x##_VSA + x##_VBP + x##_VFP) \
-	* (x##_HACT + x##_HSA + x##_HBP + x##_HFP) * 30 / 1000)
+	* (x##_HACT + x##_HSA + x##_HBP + x##_HFP) * 60 / 1000)
 
 const struct combo_dev_cfg_s dev_cfg_st7701_d310t9362v1_480x800 = {
 	.devno = 0,
@@ -89,6 +89,7 @@ static CVI_U8 data_st7701_d310t9362v1_32[] = {0xE7,0x44,0x44}; // len: 3,
 static CVI_U8 data_st7701_d310t9362v1_33[] = {0xE8,0x02,0x26,0xA0,0xA0,0x04,0x28,0xA0,0xA0,0x06,0x2A,0xA0,0xA0,0x08,0x2C,0xA0,0xA0}; // len: 17, 
 static CVI_U8 data_st7701_d310t9362v1_34[] = {0xEB,0x00,0x01,0xE4,0xE4,0x44,0x00,0x40}; // len: 8, 
 static CVI_U8 data_st7701_d310t9362v1_35[] = {0xED,0xFF,0xF7,0x65,0x4F,0x0B,0xA1,0xCF,0xFF,0xFF,0xFC,0x1A,0xB0,0xF4,0x56,0x7F,0xFF}; // len: 17, 
+static CVI_U8 data_st7701_d310t9362v1_36[] = {0xEE,0x42}; // len: 2,
 static CVI_U8 data_st7701_d310t9362v1_37[] = {0xFF,0x77,0x01,0x00,0x00,0x00}; // len: 6, 
 static CVI_U8 data_st7701_d310t9362v1_38[] = {0x36,0x00}; // len: 2, 
 static CVI_U8 data_st7701_d310t9362v1_39[] = {0x3A,0x55}; // len: 2, 
@@ -123,42 +124,43 @@ static CVI_U8 data_st7701_d310t9362v1_41[] = {0x29}; // len: 1, delay 20ms
 const struct dsc_instr dsi_init_cmds_st7701_d310t9362v1_480x800[] = {
 	{.delay = 120, .data_type = TYPE1_DCS_SHORT_WRITE, .size = 1, .data = data_st7701_d310t9362v1_1 },
 	{.delay = 120, .data_type = TYPE1_DCS_SHORT_WRITE, .size = 1, .data = data_st7701_d310t9362v1_2 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 6, .data = data_st7701_d310t9362v1_3 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_4 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_5 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 6, .data = data_st7701_d310t9362v1_6 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 3, .data = data_st7701_d310t9362v1_7 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 3, .data = data_st7701_d310t9362v1_8 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 3, .data = data_st7701_d310t9362v1_9 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_10 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_11 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 17, .data = data_st7701_d310t9362v1_12 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 17, .data = data_st7701_d310t9362v1_13 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 6, .data = data_st7701_d310t9362v1_14 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_15 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_16 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_17 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_18 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_19 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_20 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_21 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_22 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_23 },
-	{.delay = 100, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_24 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 4, .data = data_st7701_d310t9362v1_25 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 12, .data = data_st7701_d310t9362v1_26 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 13, .data = data_st7701_d310t9362v1_27 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 5, .data = data_st7701_d310t9362v1_28 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 3, .data = data_st7701_d310t9362v1_29 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 17, .data = data_st7701_d310t9362v1_30 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 5, .data = data_st7701_d310t9362v1_31 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 3, .data = data_st7701_d310t9362v1_32 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 17, .data = data_st7701_d310t9362v1_33 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 8, .data = data_st7701_d310t9362v1_34 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 17, .data = data_st7701_d310t9362v1_35 },
-	{.delay = 0, .data_type = TYPE3_GENERIC_LONG_WRITE, .size = 6, .data = data_st7701_d310t9362v1_37 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_38 },
-	{.delay = 0, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_39 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 6, .data = data_st7701_d310t9362v1_3 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_4 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_5 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 6, .data = data_st7701_d310t9362v1_6 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 3, .data = data_st7701_d310t9362v1_7 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 3, .data = data_st7701_d310t9362v1_8 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 3, .data = data_st7701_d310t9362v1_9 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_10 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_11 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 17, .data = data_st7701_d310t9362v1_12 },
+	{.delay = 110, .data_type = TYPE3_DCS_LONG_WRITE, .size = 17, .data = data_st7701_d310t9362v1_13 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 6, .data = data_st7701_d310t9362v1_14 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_15 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_16 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_17 },
+	{.delay = 110, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_18 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_19 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_20 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_21 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_22 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_23 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_24 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 4, .data = data_st7701_d310t9362v1_25 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 12, .data = data_st7701_d310t9362v1_26 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 13, .data = data_st7701_d310t9362v1_27 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 5, .data = data_st7701_d310t9362v1_28 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 3, .data = data_st7701_d310t9362v1_29 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 17, .data = data_st7701_d310t9362v1_30 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 5, .data = data_st7701_d310t9362v1_31 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 3, .data = data_st7701_d310t9362v1_32 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 17, .data = data_st7701_d310t9362v1_33 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 8, .data = data_st7701_d310t9362v1_34 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 17, .data = data_st7701_d310t9362v1_35 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_36 },
+	{.delay = 10, .data_type = TYPE3_DCS_LONG_WRITE, .size = 6, .data = data_st7701_d310t9362v1_37 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_38 },
+	{.delay = 10, .data_type = TYPE2_DCS_SHORT_WRITE, .size = 2, .data = data_st7701_d310t9362v1_39 },
 	{.delay = 120, .data_type = TYPE1_DCS_SHORT_WRITE, .size = 1, .data = data_st7701_d310t9362v1_40 },
 	{.delay = 20, .data_type = TYPE1_DCS_SHORT_WRITE, .size = 1, .data = data_st7701_d310t9362v1_41 },
 	/* LCD_Rotate_180 */
