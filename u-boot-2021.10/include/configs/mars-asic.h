@@ -246,6 +246,7 @@
 
 	#define CONFIG_EXTRA_ENV_SETTINGS	\
 		"netdev=eth0\0"		\
+		"panel=st7701_d310t9362v1\0" \
 		"consoledev=" CONSOLEDEV  \
 		"baudrate=115200\0" \
 		"uImage_addr=" __stringify(UIMAG_ADDR) "\0" \

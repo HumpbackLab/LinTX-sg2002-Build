@@ -58,3 +58,19 @@ touch xxx
 ./host/make_logo.sh input.jpeg logo.jpeg
 mcopy -i install/xxx/xxx.img@@1s logo.jpeg ::/
 ```
+
+如果只是把 `logo` 写进已经生成好的某个 SD 镜像，继续用上面这两条命令即可。
+
+如果希望以后每次重新编译/打包生成的整个 `.img` 都默认带这张 `logo`，把生成好的文件覆盖到：
+
+```
+cp logo.jpeg build/tools/common/bootlogo/logo.jpg
+```
+
+之后重新执行打包流程。现在 `sd` 镜像生成脚本会优先使用 `build/tools/common/bootlogo/logo.jpg` 作为 `.img` 第一分区里的 `logo.jpeg`。
+
+对于大分辨率图案，需要确保分辨率在屏幕分辨率范围内。默认短边在前。例如横排图片，分辨率为800x480，则需要在make_logo.sh中使用:
+```
+./host/make_logo.sh input.jpeg logo.jpeg 480 800 1
+```
+其中1表示顺时针旋转后再缩放，类似的，2是逆时针。

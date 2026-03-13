@@ -19,6 +19,9 @@ set -eu
 git_id=$(git rev-parse HEAD | head -c 6)
 image=$(LC_ALL=C date +%F-%R | sed -e 's/:/-/g' | tr -d '( ):')-${git_id}.img
 THISDIR=$(dirname $(realpath $0))
+COMMON_TOOLS_DIR=$(realpath ${THISDIR}/..)
+BOOTLOGO_FILE=${COMMON_TOOLS_DIR}/bootlogo/logo.jpeg
+LEGACY_LOGO_FILE=${THISDIR}/logo.jpeg
 mkdir -pv ${output_dir}/tmp/
 mkdir -pv ${output_dir}/root/
 mkdir -pv ${output_dir}/input/
@@ -34,7 +37,11 @@ touch ${output_dir}/input/gt9xx
 touch ${output_dir}/input/fb
 echo ${image} > ${output_dir}/input/ver
 cp -fv ${THISDIR}/genimage_rootless.cfg ${output_dir}/genimage.cfg
-cp -fv ${THISDIR}/logo.jpeg ${output_dir}/input/logo.jpeg
+if [ -f "${BOOTLOGO_FILE}" ]; then
+	cp -fv "${BOOTLOGO_FILE}" ${output_dir}/input/logo.jpeg
+else
+	cp -fv "${LEGACY_LOGO_FILE}" ${output_dir}/input/logo.jpeg
+fi
 sed -i -e "s/duo.img/${image}/g" ${output_dir}/genimage.cfg
 cd ${output_dir}/
 ${THISDIR}/genimage
