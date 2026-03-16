@@ -120,7 +120,7 @@ int cvi_board_init(void)
         //mmio_write_32(0x03001068, 0x2); // GPIOA 18 PWM 6
 
         // lcd reset
-        mmio_write_32(0x030010A4, 0x0); // PWRGPIO 0 GPIO_MODE
+        mmio_write_32(0x03001050, 0x3); // GPIOA 22 GPIO_MODE
 
 	user_led_toggle();
         // lcd backlight
@@ -169,7 +169,7 @@ int cvi_board_init(void)
 	mmio_write_32(0x03001060, 0x03); // GPIOA 24 GPIO_MODE
 	mmio_write_32(0x0300105C, 0x03); // GPIOA 23 GPIO_MODE
 	mmio_write_32(0x03001054, 0x03); // GPIOA 25 GPIO_MODE
-	mmio_write_32(0x03001050, 0x03); // GPIOA 22 GPIO_MODE
+	// GPIOA22 is used for LCD reset
 
         // wait hardware bootup
         suck_loop(50);

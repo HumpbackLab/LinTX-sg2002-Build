@@ -37,9 +37,9 @@
 	/delete-property/ pwm-gpio;
 	/delete-property/ power-ct-gpio;
 #else
-	// for uboot: panel reset is wired to PWR_GPIO0, backlight/power are external
-        reset-gpio = <&porte 0 GPIO_ACTIVE_LOW>;
-        /delete-property/ pwm-gpio;
+	// for uboot: panel reset is wired to GPIOA22, backlight is wired to GPIOB0
+        reset-gpio = <&porta 22 GPIO_ACTIVE_LOW>;
+        pwm-gpio = <&portb 0 GPIO_ACTIVE_HIGH>;
         /delete-property/ power-ct-gpio;
 #endif
 
@@ -47,9 +47,9 @@
 
 &mipi_tx {
 #ifndef __UBOOT__
-	// for linux kernel: panel reset is wired to PWR_GPIO0, backlight/power are external
-        reset-gpio = <&porte 0 GPIO_ACTIVE_LOW>;
-        /delete-property/ pwm-gpio;
+	// for linux kernel: panel reset is wired to GPIOA22, backlight is wired to GPIOB0
+        reset-gpio = <&porta 22 GPIO_ACTIVE_LOW>;
+        pwm-gpio = <&portb 0 GPIO_ACTIVE_HIGH>;
         /delete-property/ power-ct-gpio;
 #else
         /delete-property/ reset-gpio;
@@ -197,7 +197,7 @@
 		mosi-gpio = <&porta 25 0>;
 		cs-gpio = <&porta 24 GPIO_ACTIVE_LOW>;
 		num-chipselects = <1>;
-		status = "okay";
+		status = "disabled";
 
 		spidev@0 {
 			compatible = "spidev";
