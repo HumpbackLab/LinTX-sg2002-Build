@@ -3,19 +3,41 @@
 if [ "$1" = "start" ]
 then
 	. /etc/profile
-	if [ -e /boot/fb ]
+	if ! grep -q '^soph_fb ' /proc/modules
 	then
-		echo "framebuffer enable"
-		insmod /mnt/system/ko/soph_fb.ko
-		# we need keep node /dev/fb0 open
-		# graphic layer will disable after node /dev/fb0 is closed
-		(
-		exec 3<>/dev/fb0
-		while true
-		do
-			sleep 65535
-		done
-		) &
+		insmod /mnt/system/ko/soph_fb.ko || exit 1
 	fi
+
+	if [ ! -e /dev/fb0 ]
+	then
+		exit 1
+	fi
+
+	echo "framebuffer enable"
+	# Keep /dev/fb0 open; the graphic layer is disabled after the last close.
+	(
+	exec 3<>/dev/fb0
+	if [ -x /usr/bin/ffmpeg ] && [ -f /boot/logo.jpeg ]
+	then
+		fb_mode=$(head -n1 /sys/class/graphics/fb0/modes 2>/dev/null)
+		fb_w=${fb_mode#U:}
+		fb_w=${fb_w%x*}
+		fb_h=${fb_mode#*x}
+		fb_h=${fb_h%p-*}
+		if [ -n "$fb_w" ] && [ -n "$fb_h" ]
+		then
+			/usr/bin/ffmpeg -loglevel error -f lavfi -i "color=c=black:s=${fb_w}x${fb_h}" \
+				-vf "format=bgra,colorchannelmixer=aa=1" \
+				-f rawvideo -pix_fmt bgra -frames:v 1 -y - >/dev/fb0 2>/dev/null
+			/usr/bin/ffmpeg -loglevel error -i /boot/logo.jpeg \
+				-vf "scale=${fb_w}:${fb_h}:force_original_aspect_ratio=decrease,pad=${fb_w}:${fb_h}:(ow-iw)/2:(oh-ih)/2:black,format=bgra,colorchannelmixer=aa=1" \
+				-f rawvideo -pix_fmt bgra -frames:v 1 -y - >/dev/fb0 2>/dev/null
+		fi
+	fi
+	while true
+	do
+		sleep 65535
+	done
+	) &
 	exit 0
 fi

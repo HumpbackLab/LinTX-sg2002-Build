@@ -74,3 +74,16 @@ cp logo.jpeg build/tools/common/bootlogo/logo.jpg
 ./host/make_logo.sh input.jpeg logo.jpeg 480 800 1
 ```
 其中1表示顺时针旋转后再缩放，类似的，2是逆时针。
+
+Linux 启动后如果启用了 framebuffer，系统会继续复用同一张 `/boot/logo.jpeg` 作为 `/dev/fb0` 的首帧，因此后续只需要维护这一份图片。
+
+在当前平台上，`cvifb` 实测显存字节序为 `BGRA`：
+
+```
+byte0 = B
+byte1 = G
+byte2 = R
+byte3 = A
+```
+
+因此如果用户态程序直接写 `/dev/fb0`，应按 `BGRA` 写入，并把 alpha 固定为 `0xff`。如果写全 0，会因为 alpha 为 0 而显示底色，不会得到纯黑屏。
