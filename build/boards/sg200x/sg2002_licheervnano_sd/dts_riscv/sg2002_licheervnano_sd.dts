@@ -112,27 +112,17 @@
 
 &i2c4 {
         status = "okay";
-        gt9xx: gt9xx@14 {
-                compatible = "goodix,gt9xx";
-                reg = <0x14>;
-                goodix,irq-gpio = <&porte 3 0>;
-                goodix,rst-gpio = <&porte 4 0>;
-                status = "okay";
-        };
-        hynitron: hynitron@5a {
-                compatible = "hynitron,hyn_ts", "hyn,7xx";
-                reg = <0x5a>;
-                irq-gpio = <&porte 3 0>;
-                hynitron,irq-gpio = <&porte 3 0>;
-                reset-gpio = <&porte 4 0>;
-                hynitron,reset-gpio = <&porte 4 0>;
-                max-touch-number = <5>;
-                hynitron,max-touch-number = <5>;
-                display-coords = <0 0 480 640>;
-                hynitron,display-coords = <368 552>;
-                pos-swap = <0>;
-                posx-reverse = <1>;
-                posy-reverse = <1>;
+        /delete-property/ scl-gpios;
+        /delete-property/ sda-gpios;
+        scl-pinmux = <0x03001090 0x5 0x7>; /* PWR_WAKEUP0/IIC4_SCL */
+        sda-pinmux = <0x03001098 0x5 0x7>; /* PWR_BUTTON1/IIC4_SDA */
+        cst128a: cst128a@38 {
+                compatible = "hyn,cst128a";
+                reg = <0x38>;
+                irq-gpios = <&porte 3 0>;
+                reset-gpios = <&porte 4 0>;
+                touchscreen-size-x = <480>;
+                touchscreen-size-y = <800>;
                 status = "okay";
         };
 };
