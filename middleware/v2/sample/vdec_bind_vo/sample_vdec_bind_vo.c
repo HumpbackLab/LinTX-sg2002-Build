@@ -6,16 +6,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include "sample_comm.h"
 #include "sample_vdec_lib.h"
+#include "cvi_vdec.h"
 
 #define PLAYER_VDEC_CHN 0
-#define PLAYER_VPSS_GRP 0
 #define PLAYER_VPSS_CHN 0
+
+#pragma weak CVI_VDEC_SetRotation
+
+typedef enum rotate_mode_e {
+	ROTATE_MODE_CPU = 0,
+	ROTATE_MODE_VDEC = 1,
+} rotate_mode_t;
 
 typedef struct fb_ctx_s {
 	int fd;
@@ -32,17 +41,142 @@ typedef struct player_ctx_s {
 	vdecChnCtx vdec_chn;
 	fb_ctx_t fb;
 	SIZE_S output_size;
+	VPSS_GRP vpss_grp;
+	rotate_mode_t rotate_mode;
 	CVI_BOOL sys_inited;
 	CVI_BOOL vdec_started;
 	CVI_BOOL vpss_started;
+	CVI_U64 shown_frames;
+	CVI_U64 getframe_timeouts;
+	CVI_U64 vpss_send_failures;
+	CVI_U64 vpss_get_failures;
+	struct timeval start_wall;
+	struct timeval last_status_wall;
+	struct rusage last_status_usage;
+	CVI_BOOL status_initialized;
 } player_ctx_t;
 
 static volatile sig_atomic_t g_stop_requested = 0;
+
+static const char *rotate_mode_name(rotate_mode_t mode)
+{
+	return (mode == ROTATE_MODE_VDEC) ? "vdec" : "cpu";
+}
+
+static rotate_mode_t detect_rotate_mode(void)
+{
+	const char *mode = getenv("SAMPLE_VDEC_FB_ROTATE_MODE");
+
+	if (mode != NULL && strcmp(mode, "vdec") == 0)
+		return ROTATE_MODE_VDEC;
+
+	return ROTATE_MODE_CPU;
+}
+
+static void sanitize_rotate_mode(player_ctx_t *ctx)
+{
+	if (ctx->rotate_mode == ROTATE_MODE_VDEC && CVI_VDEC_SetRotation == NULL) {
+		SAMPLE_PRT("CVI_VDEC_SetRotation not exported by current SDK, fallback to cpu rotate\n");
+		ctx->rotate_mode = ROTATE_MODE_CPU;
+	}
+}
 
 static void player_handle_signal(int signo)
 {
 	if (signo == SIGINT || signo == SIGTERM || signo == SIGTSTP)
 		g_stop_requested = 1;
+}
+
+static double timeval_diff_sec(const struct timeval *newer, const struct timeval *older)
+{
+	return (double)(newer->tv_sec - older->tv_sec) +
+	       (double)(newer->tv_usec - older->tv_usec) / 1000000.0;
+}
+
+static double rusage_cpu_sec(const struct rusage *usage)
+{
+	return (double)usage->ru_utime.tv_sec +
+	       (double)usage->ru_utime.tv_usec / 1000000.0 +
+	       (double)usage->ru_stime.tv_sec +
+	       (double)usage->ru_stime.tv_usec / 1000000.0;
+}
+
+static void print_status_line(player_ctx_t *ctx, const VDEC_CHN_STATUS_S *status)
+{
+	struct timeval now;
+	struct rusage usage;
+	double elapsed;
+	double interval_wall;
+	double interval_cpu;
+	double cpu_percent;
+	double avg_fps;
+	double inst_fps;
+	static CVI_U64 last_shown_frames;
+
+	gettimeofday(&now, NULL);
+	getrusage(RUSAGE_SELF, &usage);
+
+	if (!ctx->status_initialized) {
+		ctx->start_wall = now;
+		ctx->last_status_wall = now;
+		ctx->last_status_usage = usage;
+		ctx->status_initialized = CVI_TRUE;
+		last_shown_frames = ctx->shown_frames;
+	}
+
+	elapsed = timeval_diff_sec(&now, &ctx->start_wall);
+	interval_wall = timeval_diff_sec(&now, &ctx->last_status_wall);
+	interval_cpu = rusage_cpu_sec(&usage) - rusage_cpu_sec(&ctx->last_status_usage);
+	cpu_percent = (interval_wall > 0.0) ? (interval_cpu / interval_wall) * 100.0 : 0.0;
+	avg_fps = (elapsed > 0.0) ? ((double)ctx->shown_frames / elapsed) : 0.0;
+	inst_fps = (interval_wall > 0.0) ?
+		((double)(ctx->shown_frames - last_shown_frames) / interval_wall) : 0.0;
+
+	printf("\rstatus shown=%llu recv=%u dec=%u leftBytes=%u leftFrames=%u leftPics=%u fps=%.1f avg=%.1f cpu=%.1f%% elapsed=%.1fs",
+	       (unsigned long long)ctx->shown_frames,
+	       status->u32RecvStreamFrames,
+	       status->u32DecodeStreamFrames,
+	       status->u32LeftStreamBytes,
+	       status->u32LeftStreamFrames,
+	       status->u32LeftPics,
+	       inst_fps,
+	       avg_fps,
+	       cpu_percent,
+	       elapsed);
+	fflush(stdout);
+
+	ctx->last_status_wall = now;
+	ctx->last_status_usage = usage;
+	last_shown_frames = ctx->shown_frames;
+}
+
+static void print_summary(const player_ctx_t *ctx, const VDEC_CHN_STATUS_S *status)
+{
+	struct timeval now;
+	struct rusage usage;
+	double elapsed;
+	double cpu_sec;
+	double avg_fps;
+
+	gettimeofday(&now, NULL);
+	getrusage(RUSAGE_SELF, &usage);
+	elapsed = timeval_diff_sec(&now, &ctx->start_wall);
+	cpu_sec = rusage_cpu_sec(&usage);
+	avg_fps = (elapsed > 0.0) ? ((double)ctx->shown_frames / elapsed) : 0.0;
+
+	printf("\nsummary shown=%llu recv=%u dec=%u avg_fps=%.2f cpu_time=%.2fs elapsed=%.2fs getframe_timeouts=%llu vpss_send_fail=%llu vpss_get_fail=%llu leftBytes=%u leftFrames=%u leftPics=%u\n",
+	       (unsigned long long)ctx->shown_frames,
+	       status->u32RecvStreamFrames,
+	       status->u32DecodeStreamFrames,
+	       avg_fps,
+	       cpu_sec,
+	       elapsed,
+	       (unsigned long long)ctx->getframe_timeouts,
+	       (unsigned long long)ctx->vpss_send_failures,
+	       (unsigned long long)ctx->vpss_get_failures,
+	       status->u32LeftStreamBytes,
+	       status->u32LeftStreamFrames,
+	       status->u32LeftPics);
 }
 
 static int detect_fb0_size(SIZE_S *size)
@@ -246,6 +380,7 @@ static CVI_S32 init_vdec(player_ctx_t *ctx)
 	VDEC_CHN_ATTR_S chn_attr;
 	VDEC_CHN_PARAM_S chn_param;
 	PAYLOAD_TYPE_E en_type = chn_cfg->enType;
+	CVI_S32 ret;
 
 	memset(chn_ctx, 0, sizeof(*chn_ctx));
 	memset(&chn_attr, 0, sizeof(chn_attr));
@@ -274,6 +409,14 @@ static CVI_S32 init_vdec(player_ctx_t *ctx)
 	chn_param.enPixelFormat = PIXEL_FORMAT_NV21;
 	chn_param.u32DisplayFrameNum = 1;
 	CHECK_RET(CVI_VDEC_SetChnParam(PLAYER_VDEC_CHN, &chn_param), "CVI_VDEC_SetChnParam");
+	if (ctx->rotate_mode == ROTATE_MODE_VDEC) {
+		ret = CVI_VDEC_SetRotation(PLAYER_VDEC_CHN, ROTATION_270);
+		if (ret != CVI_SUCCESS) {
+			SAMPLE_PRT("CVI_VDEC_SetRotation(270) failed with %#x\n", ret);
+			return ret;
+		}
+		SAMPLE_PRT("using VDEC rotate270 path\n");
+	}
 	CHECK_RET(CVI_VDEC_StartRecvStream(PLAYER_VDEC_CHN), "CVI_VDEC_StartRecvStream");
 	ctx->vdec_started = CVI_TRUE;
 	return CVI_SUCCESS;
@@ -284,9 +427,18 @@ static CVI_S32 init_vpss(player_ctx_t *ctx)
 	VPSS_GRP_ATTR_S grp_attr;
 	VPSS_CHN_ATTR_S chn_attr[VPSS_MAX_PHY_CHN_NUM];
 	CVI_BOOL chn_enable[VPSS_MAX_PHY_CHN_NUM] = {0};
+	VPSS_GRP vpss_grp;
 
 	memset(&grp_attr, 0, sizeof(grp_attr));
 	memset(chn_attr, 0, sizeof(chn_attr));
+
+	vpss_grp = CVI_VPSS_GetAvailableGrp();
+	if (vpss_grp < 0) {
+		SAMPLE_PRT("no available VPSS group, fallback to grp0\n");
+		vpss_grp = 0;
+		CVI_VPSS_DestroyGrp(vpss_grp);
+	}
+	ctx->vpss_grp = vpss_grp;
 
 	grp_attr.stFrameRate.s32SrcFrameRate = -1;
 	grp_attr.stFrameRate.s32DstFrameRate = -1;
@@ -299,7 +451,7 @@ static CVI_S32 init_vpss(player_ctx_t *ctx)
 	chn_attr[PLAYER_VPSS_CHN].u32Width = ctx->output_size.u32Width;
 	chn_attr[PLAYER_VPSS_CHN].u32Height = ctx->output_size.u32Height;
 	chn_attr[PLAYER_VPSS_CHN].enVideoFormat = VIDEO_FORMAT_LINEAR;
-	chn_attr[PLAYER_VPSS_CHN].enPixelFormat = PIXEL_FORMAT_RGB_888;
+	chn_attr[PLAYER_VPSS_CHN].enPixelFormat = PIXEL_FORMAT_BGR_888;
 	chn_attr[PLAYER_VPSS_CHN].stFrameRate.s32SrcFrameRate = -1;
 	chn_attr[PLAYER_VPSS_CHN].stFrameRate.s32DstFrameRate = -1;
 	chn_attr[PLAYER_VPSS_CHN].u32Depth = 3;
@@ -310,15 +462,91 @@ static CVI_S32 init_vpss(player_ctx_t *ctx)
 	chn_attr[PLAYER_VPSS_CHN].stAspectRatio.u32BgColor = COLOR_RGB_BLACK;
 	chn_attr[PLAYER_VPSS_CHN].stNormalize.bEnable = CVI_FALSE;
 
-	CHECK_RET(SAMPLE_COMM_VPSS_Init(PLAYER_VPSS_GRP, chn_enable, &grp_attr, chn_attr),
+	CHECK_RET(SAMPLE_COMM_VPSS_Init(ctx->vpss_grp, chn_enable, &grp_attr, chn_attr),
 		  "SAMPLE_COMM_VPSS_Init");
-	CHECK_RET(SAMPLE_COMM_VPSS_Start(PLAYER_VPSS_GRP, chn_enable, &grp_attr, chn_attr),
+	CHECK_RET(SAMPLE_COMM_VPSS_Start(ctx->vpss_grp, chn_enable, &grp_attr, chn_attr),
 		  "SAMPLE_COMM_VPSS_Start");
+	SAMPLE_PRT("using VPSS grp %d\n", ctx->vpss_grp);
 	ctx->vpss_started = CVI_TRUE;
 	return CVI_SUCCESS;
 }
 
-static void blit_rgb888_to_fb(const fb_ctx_t *fb, const VIDEO_FRAME_INFO_S *frame)
+static void blit_bgr888_direct_to_fb(const fb_ctx_t *fb, const VIDEO_FRAME_INFO_S *frame)
+{
+	const VIDEO_FRAME_S *vframe = &frame->stVFrame;
+	unsigned int src_x;
+	unsigned int src_y;
+	unsigned int copy_width = (vframe->u32Width < fb->width) ? vframe->u32Width : fb->width;
+	unsigned int copy_height = (vframe->u32Height < fb->height) ? vframe->u32Height : fb->height;
+	const unsigned char *src_base;
+
+	if (vframe->pu8VirAddr[0] == NULL) {
+		CVI_SYS_IonInvalidateCache(vframe->u64PhyAddr[0], NULL, vframe->u32Length[0]);
+		src_base = CVI_SYS_Mmap(vframe->u64PhyAddr[0], vframe->u32Length[0]);
+		if (src_base == NULL) {
+			SAMPLE_PRT("CVI_SYS_Mmap BGR frame failed\n");
+			return;
+		}
+	} else {
+		CVI_SYS_IonInvalidateCache(vframe->u64PhyAddr[0], vframe->pu8VirAddr[0], vframe->u32Length[0]);
+		src_base = vframe->pu8VirAddr[0];
+	}
+
+	for (src_y = 0; src_y < fb->height; ++src_y) {
+		unsigned char *dst = fb->mem + src_y * fb->stride;
+
+		if (src_y >= copy_height) {
+			for (src_x = 0; src_x < fb->width; ++src_x) {
+				dst[src_x * 4 + 0] = 0x00;
+				dst[src_x * 4 + 1] = 0x00;
+				dst[src_x * 4 + 2] = 0x00;
+				dst[src_x * 4 + 3] = 0xff;
+			}
+			continue;
+		}
+
+		const unsigned char *src_row = src_base + src_y * vframe->u32Stride[0];
+		for (src_x = 0; src_x < fb->width; ++src_x) {
+			if (src_x < copy_width) {
+				const unsigned char *src = src_row + src_x * 3;
+
+				if (fb->bits_per_pixel == 32) {
+					dst[src_x * 4 + 0] = src[0];
+					dst[src_x * 4 + 1] = src[1];
+					dst[src_x * 4 + 2] = src[2];
+					dst[src_x * 4 + 3] = 0xff;
+				} else if (fb->bits_per_pixel == 24) {
+					dst[src_x * 3 + 0] = src[0];
+					dst[src_x * 3 + 1] = src[1];
+					dst[src_x * 3 + 2] = src[2];
+				} else if (fb->bits_per_pixel == 16) {
+					unsigned short *dst16 = (unsigned short *)dst;
+					unsigned char r = src[2];
+					unsigned char g = src[1];
+					unsigned char b = src[0];
+					dst16[src_x] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+				}
+			} else if (fb->bits_per_pixel == 32) {
+				dst[src_x * 4 + 0] = 0x00;
+				dst[src_x * 4 + 1] = 0x00;
+				dst[src_x * 4 + 2] = 0x00;
+				dst[src_x * 4 + 3] = 0xff;
+			} else if (fb->bits_per_pixel == 24) {
+				dst[src_x * 3 + 0] = 0x00;
+				dst[src_x * 3 + 1] = 0x00;
+				dst[src_x * 3 + 2] = 0x00;
+			} else if (fb->bits_per_pixel == 16) {
+				unsigned short *dst16 = (unsigned short *)dst;
+				dst16[src_x] = 0x0000;
+			}
+		}
+	}
+
+	if (vframe->pu8VirAddr[0] == NULL)
+		CVI_SYS_Munmap((void *)src_base, vframe->u32Length[0]);
+}
+
+static void blit_bgr888_rotate270_to_fb(const fb_ctx_t *fb, const VIDEO_FRAME_INFO_S *frame)
 {
 	const VIDEO_FRAME_S *vframe = &frame->stVFrame;
 	unsigned int src_x;
@@ -331,7 +559,7 @@ static void blit_rgb888_to_fb(const fb_ctx_t *fb, const VIDEO_FRAME_INFO_S *fram
 		CVI_SYS_IonInvalidateCache(vframe->u64PhyAddr[0], NULL, vframe->u32Length[0]);
 		src_base = CVI_SYS_Mmap(vframe->u64PhyAddr[0], vframe->u32Length[0]);
 		if (src_base == NULL) {
-			SAMPLE_PRT("CVI_SYS_Mmap RGB frame failed\n");
+			SAMPLE_PRT("CVI_SYS_Mmap BGR frame failed\n");
 			return;
 		}
 	} else {
@@ -349,19 +577,19 @@ static void blit_rgb888_to_fb(const fb_ctx_t *fb, const VIDEO_FRAME_INFO_S *fram
 			unsigned char *dst = fb->mem + dst_y * fb->stride;
 
 			if (fb->bits_per_pixel == 32) {
-				dst[dst_x * 4 + 0] = src[2];
+				dst[dst_x * 4 + 0] = src[0];
 				dst[dst_x * 4 + 1] = src[1];
-				dst[dst_x * 4 + 2] = src[0];
+				dst[dst_x * 4 + 2] = src[2];
 				dst[dst_x * 4 + 3] = 0xff;
 			} else if (fb->bits_per_pixel == 24) {
-				dst[dst_x * 3 + 0] = src[2];
+				dst[dst_x * 3 + 0] = src[0];
 				dst[dst_x * 3 + 1] = src[1];
-				dst[dst_x * 3 + 2] = src[0];
+				dst[dst_x * 3 + 2] = src[2];
 			} else if (fb->bits_per_pixel == 16) {
 				unsigned short *dst16 = (unsigned short *)dst;
-				unsigned char r = src[0];
+				unsigned char r = src[2];
 				unsigned char g = src[1];
-				unsigned char b = src[2];
+				unsigned char b = src[0];
 				dst16[dst_x] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 			}
 		}
@@ -383,32 +611,51 @@ static CVI_S32 playback_loop(player_ctx_t *ctx)
 
 	memset(&vdec_frame, 0, sizeof(vdec_frame));
 	memset(&rgb_frame, 0, sizeof(rgb_frame));
+	gettimeofday(&ctx->start_wall, NULL);
+	ctx->last_status_wall = ctx->start_wall;
+	getrusage(RUSAGE_SELF, &ctx->last_status_usage);
+	ctx->status_initialized = CVI_TRUE;
 
 	while (!g_stop_requested) {
 		ret = CVI_VDEC_GetFrame(PLAYER_VDEC_CHN, &vdec_frame, 1000);
 		if (ret == CVI_SUCCESS) {
-			ret = CVI_VPSS_SendFrame(PLAYER_VPSS_GRP, &vdec_frame, 1000);
+			ret = CVI_VPSS_SendFrame(ctx->vpss_grp, &vdec_frame, 1000);
 			CVI_VDEC_ReleaseFrame(PLAYER_VDEC_CHN, &vdec_frame);
 			memset(&vdec_frame, 0, sizeof(vdec_frame));
 			if (ret != CVI_SUCCESS) {
+				ctx->vpss_send_failures++;
 				SAMPLE_PRT("CVI_VPSS_SendFrame failed with %#x\n", ret);
 				continue;
 			}
 
-			ret = CVI_VPSS_GetChnFrame(PLAYER_VPSS_GRP, PLAYER_VPSS_CHN, &rgb_frame, 1000);
+			ret = CVI_VPSS_GetChnFrame(ctx->vpss_grp, PLAYER_VPSS_CHN, &rgb_frame, 1000);
 			if (ret != CVI_SUCCESS) {
+				ctx->vpss_get_failures++;
 				SAMPLE_PRT("CVI_VPSS_GetChnFrame failed with %#x\n", ret);
 				continue;
 			}
 
-			blit_rgb888_to_fb(&ctx->fb, &rgb_frame);
-			CVI_VPSS_ReleaseChnFrame(PLAYER_VPSS_GRP, PLAYER_VPSS_CHN, &rgb_frame);
+			if (ctx->rotate_mode == ROTATE_MODE_VDEC)
+				blit_bgr888_direct_to_fb(&ctx->fb, &rgb_frame);
+			else
+				blit_bgr888_rotate270_to_fb(&ctx->fb, &rgb_frame);
+			CVI_VPSS_ReleaseChnFrame(ctx->vpss_grp, PLAYER_VPSS_CHN, &rgb_frame);
 			memset(&rgb_frame, 0, sizeof(rgb_frame));
+			ctx->shown_frames++;
 			idle_loops = 0;
+			CHECK_RET(CVI_VDEC_QueryStatus(PLAYER_VDEC_CHN, &status), "CVI_VDEC_QueryStatus");
+			{
+				struct timeval now;
+				gettimeofday(&now, NULL);
+				if (timeval_diff_sec(&now, &ctx->last_status_wall) >= 0.5)
+					print_status_line(ctx, &status);
+			}
 			continue;
 		}
 
-		if (ret != CVI_ERR_VDEC_BUSY)
+		if (ret == CVI_ERR_VDEC_BUSY)
+			ctx->getframe_timeouts++;
+		else
 			SAMPLE_PRT("CVI_VDEC_GetFrame failed with %#x\n", ret);
 
 		CHECK_RET(CVI_VDEC_QueryStatus(PLAYER_VDEC_CHN, &status), "CVI_VDEC_QueryStatus");
@@ -416,22 +663,19 @@ static CVI_S32 playback_loop(player_ctx_t *ctx)
 		    status.u32LeftStreamBytes == 0 &&
 		    status.u32LeftStreamFrames == 0 &&
 		    status.u32LeftPics == 0) {
+			print_summary(ctx, &status);
 			return CVI_SUCCESS;
 		}
 
 		idle_loops++;
 		if (idle_loops >= 10) {
-			SAMPLE_PRT("vdec recv=%u dec=%u leftBytes=%u leftFrames=%u leftPics=%u fileEnd=%d\n",
-				   status.u32RecvStreamFrames,
-				   status.u32DecodeStreamFrames,
-				   status.u32LeftStreamBytes,
-				   status.u32LeftStreamFrames,
-				   status.u32LeftPics,
-				   send_param->bFileEnd);
+			print_status_line(ctx, &status);
 			idle_loops = 0;
 		}
 	}
 
+	CHECK_RET(CVI_VDEC_QueryStatus(PLAYER_VDEC_CHN, &status), "CVI_VDEC_QueryStatus");
+	print_summary(ctx, &status);
 	return CVI_SUCCESS;
 }
 
@@ -447,7 +691,7 @@ static void player_stop(player_ctx_t *ctx)
 
 	if (ctx->vpss_started) {
 		chn_enable[PLAYER_VPSS_CHN] = CVI_TRUE;
-		SAMPLE_COMM_VPSS_Stop(PLAYER_VPSS_GRP, chn_enable);
+		SAMPLE_COMM_VPSS_Stop(ctx->vpss_grp, chn_enable);
 		ctx->vpss_started = CVI_FALSE;
 	}
 
@@ -472,6 +716,9 @@ int main(int argc, char **argv)
 
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.fb.fd = -1;
+	ctx.vpss_grp = -1;
+	ctx.rotate_mode = detect_rotate_mode();
+	sanitize_rotate_mode(&ctx);
 
 	ret = parseDecArgv(&ctx.input_cfg, argc, argv);
 	if (ret < 0) {
@@ -489,8 +736,13 @@ int main(int argc, char **argv)
 	if (fb_open(&ctx.fb, "/dev/fb0") != 0)
 		return CVI_FAILURE;
 
-	ctx.output_size.u32Width = ctx.fb.height;
-	ctx.output_size.u32Height = ctx.fb.width;
+	if (ctx.rotate_mode == ROTATE_MODE_VDEC) {
+		ctx.output_size.u32Width = ctx.fb.width;
+		ctx.output_size.u32Height = ctx.fb.height;
+	} else {
+		ctx.output_size.u32Width = ctx.fb.height;
+		ctx.output_size.u32Height = ctx.fb.width;
+	}
 	if (ctx.output_size.u32Width == 0 || ctx.output_size.u32Height == 0) {
 		if (detect_fb0_size(&ctx.output_size) != 0) {
 			SAMPLE_PRT("failed to detect framebuffer size\n");
@@ -526,10 +778,11 @@ int main(int argc, char **argv)
 	signal(SIGTSTP, player_handle_signal);
 
 	fb_clear(&ctx.fb);
-	SAMPLE_PRT("fb playback start: %s -> %ux%u fb0 (%ubpp)\n",
+	SAMPLE_PRT("fb playback start: %s -> %ux%u fb0 (%ubpp), rotate=%s\n",
 		   ctx.input_cfg.chnInCfg[0].input_path,
 		   ctx.output_size.u32Width, ctx.output_size.u32Height,
-		   ctx.fb.bits_per_pixel);
+		   ctx.fb.bits_per_pixel,
+		   rotate_mode_name(ctx.rotate_mode));
 
 	ret = playback_loop(&ctx);
 	player_stop(&ctx);

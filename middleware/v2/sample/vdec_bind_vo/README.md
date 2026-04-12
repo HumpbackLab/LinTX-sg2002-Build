@@ -52,10 +52,17 @@ Display details:
 
 - framebuffer target is read from `/dev/fb0`
 - the current board exposes `fb0` as `480x800`
-- VPSS output is configured as horizontal content (`800x480`)
-- framebuffer write path applies `rotate270`
+- default VPSS output is configured as horizontal content (`800x480`)
+- default framebuffer write path applies `rotate270`
+- VPSS now outputs `BGR_888`, which matches `cvifb` byte order more closely and avoids a per-pixel RGB/BGR swap in userspace
 - `32bpp` framebuffer writes use `BGRA`
 - alpha is forced to `0xff`
+
+Experimental rotation mode:
+
+- set `SAMPLE_VDEC_FB_ROTATE_MODE=vdec`
+- this asks the sample to try `VDEC` `rotate270` first
+- if the current SDK does not export that symbol or runtime setup rejects it, the sample falls back to CPU rotate automatically
 
 This is enough to display standard horizontal content such as a `1280x720` test stream on the built-in panel in the expected physical viewing orientation.
 
@@ -65,6 +72,7 @@ This is enough to display standard horizontal content such as a `1280x720` test 
 - horizontal source material scaled to panel size
 - fixed `rotate270` presentation for the current framebuffer orientation
 - color output on this board's `cvifb` byte order (`BGRA`)
+- lower userspace color-conversion cost than the first fb0 version because the VPSS output is already `BGR_888`
 
 ## Known Limitations
 
