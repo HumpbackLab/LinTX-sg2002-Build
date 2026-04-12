@@ -16,6 +16,7 @@ then
 	insmod soph_dwa.ko
 	insmod soph_vo.ko
 	grep -q '^soph_mipi_tx ' /proc/modules || insmod soph_mipi_tx.ko
+	insmod cst128a_ts.ko
 	insmod soph_rgn.ko
 	insmod soph_tpu.ko
 	insmod soph_vcodec.ko

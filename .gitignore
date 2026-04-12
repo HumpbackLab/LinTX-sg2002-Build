@@ -13,6 +13,8 @@ install/*
 linux_5.10/build/*
 middleware/v2/sample/ive/ive_stress
 middleware/v2/sample/sample_panel/sample_panel
+middleware/v2/sample/vdec_bind_vo/sample_vdec_bind_vo
+file_example_MP4_1920_18MG.mp4
 osdrv/extdrv/tp/ts_gsl/ts_gslX680.ko
 osdrv/extdrv/tp/ts_gt9xx/gt9xx.ko
 osdrv/extdrv/wiegand-gpio/cvi_wiegand_gpio.ko
