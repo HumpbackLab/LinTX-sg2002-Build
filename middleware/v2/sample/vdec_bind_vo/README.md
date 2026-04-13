@@ -55,6 +55,9 @@ Hardware display details:
 - default rotate mode is `vo`
 - `VO` backend keeps the VPSS output in `NV21` so that hardware rotation remains available
 - `vo` or `vpss` rotation modes use a fixed `rotate270` mapping that matches the panel orientation used by the earlier framebuffer path
+- panel size can be overridden with `SAMPLE_VDEC_PANEL_WIDTH` and `SAMPLE_VDEC_PANEL_HEIGHT`; defaults remain `480x800`
+- `vo/sendframe` now defaults to `SAMPLE_VDEC_VO_CPU_PAD=1`, which allocates a full output-sized `NV21` staging frame in userspace, clears it to black, and copies the scaled VPSS content into the centered region before `CVI_VO_SendFrame`
+- that CPU-side padding path is the current practical workaround for aspect-ratio mismatches on this SDK path because the earlier `VPSS` / `VO` rectangle attempts did not produce reliable centered output on the target board
 
 Backend selection:
 
@@ -102,6 +105,7 @@ Latest verified result on the current board:
 - observed status:
   `shown=617`, `leftPics=0`, `avg=44.7fps`, `cpu=23.7%`
 - repeated `CVI_VDEC_GetFrame` return `0xc0058041` is now treated as a benign idle/no-frame condition rather than a fatal playback error
+- with the default CPU padding workaround enabled, another run showed `shown=243`, `avg=42.9fps`, `cpu=88.6%`; playback stayed fluid enough, but the added per-frame memory clear and copy drives CPU usage much higher
 
 ## Known Limitations
 
@@ -110,6 +114,7 @@ Latest verified result on the current board:
 - the sample is still board-specific rather than a generic panel abstraction
 - `VDEC` rotation availability depends on the SDK exporting `CVI_VDEC_SetRotation`
 - the framebuffer backend is still CPU-heavy because the final display step is a userspace blit
+- the default `VO` aspect-ratio workaround is also CPU-heavy because it pads every output frame on the CPU before handing it to `VO`; this avoids exposed green edges, but it is not a zero-copy solution
 
 VO / VPSS rotation notes:
 
@@ -117,6 +122,7 @@ VO / VPSS rotation notes:
 - `VPSS` rotation is left as an experimental switch because its output alignment rules are stricter than the `VO` rotation path
 - current default is `VO` rotation because it most closely matches the stock SDK samples in this tree
 - in `vo/sendframe` mode, `0xc0058041` from `CVI_VDEC_GetFrame` behaves like an internal no-frame-yet return on this SDK / board combination and should be counted as idle polling, not logged as a hard failure
+- `SAMPLE_VDEC_VO_CPU_PAD=0` can be used to disable the userspace padding experiment if you want to compare raw `VO` behavior again, but that path currently does not guarantee centered output or black borders on the tested board / SDK combination
 
 Framebuffer fallback notes:
 

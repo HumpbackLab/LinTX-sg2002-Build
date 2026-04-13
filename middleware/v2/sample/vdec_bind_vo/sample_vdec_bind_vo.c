@@ -76,6 +76,9 @@ typedef struct player_ctx_s {
 	VIDEO_FRAME_INFO_S stage_frame;
 	SIZE_S panel_size;
 	SIZE_S output_size;
+	SIZE_S source_size;
+	RECT_S video_rect;
+	RECT_S content_rect;
 	VPSS_GRP vpss_grp;
 	SAMPLE_VO_CONFIG_S vo_config;
 	rotate_mode_t rotate_mode;
@@ -83,6 +86,7 @@ typedef struct player_ctx_s {
 	output_mode_t output_mode;
 	display_backend_t display_backend;
 	vo_path_mode_t vo_path_mode;
+	CVI_BOOL vo_cpu_pad;
 	IVE_HANDLE ive_handle;
 	CVI_BOOL sys_inited;
 	CVI_BOOL vdec_started;
@@ -90,6 +94,10 @@ typedef struct player_ctx_s {
 	CVI_BOOL vo_started;
 	CVI_BOOL vdec_vpss_bound;
 	CVI_BOOL vpss_vo_bound;
+	CVI_BOOL vo_stage_ready;
+	VB_BLK vo_stage_blk;
+	CVI_VOID *vo_stage_mem;
+	CVI_U32 vo_stage_size;
 	CVI_BOOL stage_ready;
 	CVI_U64 shown_frames;
 	CVI_U64 getframe_timeouts;
@@ -107,6 +115,9 @@ typedef struct player_ctx_s {
 } player_ctx_t;
 
 static volatile sig_atomic_t g_stop_requested = 0;
+
+static CVI_S32 build_vo_padded_frame(player_ctx_t *ctx, const VIDEO_FRAME_INFO_S *src_frame,
+				     VIDEO_FRAME_INFO_S **out_frame);
 
 static CVI_VOID *player_send_stream_thread(CVI_VOID *pArgs)
 {
@@ -573,6 +584,102 @@ static CVI_BOOL is_vdec_getframe_idle_ret(CVI_S32 ret)
 	return (ret == CVI_ERR_VDEC_BUSY || ret == PLAYER_VDEC_NO_FRAME_RET);
 }
 
+static CVI_BOOL detect_env_enabled(const char *name, CVI_BOOL default_value)
+{
+	const char *value = getenv(name);
+
+	if (value == NULL || value[0] == '\0')
+		return default_value;
+	if (!strcmp(value, "0") || !strcmp(value, "false") || !strcmp(value, "off") || !strcmp(value, "no"))
+		return CVI_FALSE;
+	if (!strcmp(value, "1") || !strcmp(value, "true") || !strcmp(value, "on") || !strcmp(value, "yes"))
+		return CVI_TRUE;
+
+	SAMPLE_PRT("ignore invalid %s=%s, fallback to %d\n", name, value, default_value);
+	return default_value;
+}
+
+static CVI_U32 detect_env_u32(const char *name, CVI_U32 default_value)
+{
+	const char *value = getenv(name);
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (value == NULL || value[0] == '\0')
+		return default_value;
+
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0' || parsed == 0 || parsed > UINT32_MAX) {
+		SAMPLE_PRT("ignore invalid %s=%s, fallback to %u\n", name, value, default_value);
+		return default_value;
+	}
+
+	return (CVI_U32)parsed;
+}
+
+static CVI_U32 align_even_down(CVI_U32 value)
+{
+	if (value <= 2)
+		return value;
+	return value & ~1U;
+}
+
+static void compute_centered_rect(const SIZE_S *src, const SIZE_S *dst, RECT_S *rect)
+{
+	CVI_U32 scaled_width;
+	CVI_U32 scaled_height;
+
+	memset(rect, 0, sizeof(*rect));
+	if (src->u32Width == 0 || src->u32Height == 0 ||
+	    dst->u32Width == 0 || dst->u32Height == 0) {
+		rect->u32Width = dst->u32Width;
+		rect->u32Height = dst->u32Height;
+		return;
+	}
+
+	if ((CVI_U64)src->u32Width * dst->u32Height >= (CVI_U64)dst->u32Width * src->u32Height) {
+		scaled_width = dst->u32Width;
+		scaled_height = (CVI_U32)(((CVI_U64)dst->u32Width * src->u32Height) / src->u32Width);
+	} else {
+		scaled_height = dst->u32Height;
+		scaled_width = (CVI_U32)(((CVI_U64)dst->u32Height * src->u32Width) / src->u32Height);
+	}
+
+	scaled_width = align_even_down(scaled_width);
+	scaled_height = align_even_down(scaled_height);
+	if (scaled_width == 0)
+		scaled_width = (dst->u32Width > 1) ? 2 : dst->u32Width;
+	if (scaled_height == 0)
+		scaled_height = (dst->u32Height > 1) ? 2 : dst->u32Height;
+	if (scaled_width > dst->u32Width)
+		scaled_width = align_even_down(dst->u32Width);
+	if (scaled_height > dst->u32Height)
+		scaled_height = align_even_down(dst->u32Height);
+
+	rect->u32Width = scaled_width;
+	rect->u32Height = scaled_height;
+	rect->s32X = (CVI_S32)((dst->u32Width - rect->u32Width) / 2);
+	rect->s32Y = (CVI_S32)((dst->u32Height - rect->u32Height) / 2);
+	rect->s32X &= ~1;
+	rect->s32Y &= ~1;
+}
+
+static void compute_display_layout(player_ctx_t *ctx, CVI_U32 src_width, CVI_U32 src_height)
+{
+	SIZE_S layout_src;
+
+	ctx->source_size.u32Width = src_width;
+	ctx->source_size.u32Height = src_height;
+	compute_centered_rect(&ctx->source_size, &ctx->output_size, &ctx->content_rect);
+	layout_src = ctx->source_size;
+	if (ctx->rotate_mode == ROTATE_MODE_VO || ctx->rotate_mode == ROTATE_MODE_VPSS) {
+		layout_src.u32Width = src_height;
+		layout_src.u32Height = src_width;
+	}
+	compute_centered_rect(&layout_src, &ctx->panel_size, &ctx->video_rect);
+}
+
 static void print_status_line(player_ctx_t *ctx, const VDEC_CHN_STATUS_S *status)
 {
 	struct timeval now;
@@ -585,6 +692,7 @@ static void print_status_line(player_ctx_t *ctx, const VDEC_CHN_STATUS_S *status
 	double inst_fps;
 	static CVI_U64 last_shown_frames;
 
+	(void)status;
 	gettimeofday(&now, NULL);
 	getrusage(RUSAGE_SELF, &usage);
 
@@ -604,13 +712,8 @@ static void print_status_line(player_ctx_t *ctx, const VDEC_CHN_STATUS_S *status
 	inst_fps = (interval_wall > 0.0) ?
 		((double)(ctx->shown_frames - last_shown_frames) / interval_wall) : 0.0;
 
-	printf("\rstatus shown=%llu recv=%u dec=%u leftBytes=%u leftFrames=%u leftPics=%u fps=%.1f avg=%.1f cpu=%.1f%% elapsed=%.1fs",
+	printf("\rstatus shown=%llu fps=%.1f avg=%.1f cpu=%.1f%% elapsed=%.1fs",
 	       (unsigned long long)ctx->shown_frames,
-	       status->u32RecvStreamFrames,
-	       status->u32DecodeStreamFrames,
-	       status->u32LeftStreamBytes,
-	       status->u32LeftStreamFrames,
-	       status->u32LeftPics,
 	       inst_fps,
 	       avg_fps,
 	       cpu_percent,
@@ -630,16 +733,15 @@ static void print_summary(const player_ctx_t *ctx, const VDEC_CHN_STATUS_S *stat
 	double cpu_sec;
 	double avg_fps;
 
+	(void)status;
 	gettimeofday(&now, NULL);
 	getrusage(RUSAGE_SELF, &usage);
 	elapsed = timeval_diff_sec(&now, &ctx->start_wall);
 	cpu_sec = rusage_cpu_sec(&usage);
 	avg_fps = (elapsed > 0.0) ? ((double)ctx->shown_frames / elapsed) : 0.0;
 
-	printf("\nsummary shown=%llu recv=%u dec=%u avg_fps=%.2f cpu_time=%.2fs elapsed=%.2fs getframe_timeouts=%llu vpss_send_fail=%llu vpss_get_fail=%llu vdec_get_ms=%.1f(%.3f/f) vpss_send_ms=%.1f(%.3f/f) vpss_get_ms=%.1f(%.3f/f) blit_ms=%.1f(%.3f/f) tdma_ms=%.1f(%.3f/f) leftBytes=%u leftFrames=%u leftPics=%u\n",
+	printf("\nsummary shown=%llu avg_fps=%.2f cpu_time=%.2fs elapsed=%.2fs getframe_timeouts=%llu vpss_send_fail=%llu vpss_get_fail=%llu vdec_get_ms=%.1f(%.3f/f) vpss_send_ms=%.1f(%.3f/f) vpss_get_ms=%.1f(%.3f/f) blit_ms=%.1f(%.3f/f) tdma_ms=%.1f(%.3f/f)\n",
 	       (unsigned long long)ctx->shown_frames,
-	       status->u32RecvStreamFrames,
-	       status->u32DecodeStreamFrames,
 	       avg_fps,
 	       cpu_sec,
 	       elapsed,
@@ -650,10 +752,7 @@ static void print_summary(const player_ctx_t *ctx, const VDEC_CHN_STATUS_S *stat
 	       ctx->time_vpss_send_sec * 1000.0, avg_ms_per_frame(ctx->time_vpss_send_sec, ctx->shown_frames),
 	       ctx->time_vpss_get_sec * 1000.0, avg_ms_per_frame(ctx->time_vpss_get_sec, ctx->shown_frames),
 	       ctx->time_blit_sec * 1000.0, avg_ms_per_frame(ctx->time_blit_sec, ctx->shown_frames),
-	       ctx->time_tdma_sec * 1000.0, avg_ms_per_frame(ctx->time_tdma_sec, ctx->shown_frames),
-	       status->u32LeftStreamBytes,
-	       status->u32LeftStreamFrames,
-	       status->u32LeftPics);
+	       ctx->time_tdma_sec * 1000.0, avg_ms_per_frame(ctx->time_tdma_sec, ctx->shown_frames));
 }
 
 static int detect_fb0_size(SIZE_S *size)
@@ -812,6 +911,80 @@ static void stage_close(player_ctx_t *ctx)
 	memset(&ctx->stage_frame, 0, sizeof(ctx->stage_frame));
 	ctx->stage_fb.fd = -1;
 	ctx->stage_ready = CVI_FALSE;
+}
+
+static CVI_S32 vo_stage_open(player_ctx_t *ctx)
+{
+	VB_CAL_CONFIG_S cal_cfg;
+	CVI_U64 phy_addr;
+	CVI_U32 chroma_offset;
+	CVI_VOID *vir_addr = NULL;
+
+	memset(&ctx->stage_frame, 0, sizeof(ctx->stage_frame));
+	ctx->vo_stage_blk = VB_INVALID_HANDLE;
+	ctx->vo_stage_mem = NULL;
+	ctx->vo_stage_size = 0;
+
+	COMMON_GetPicBufferConfig(ctx->output_size.u32Width, ctx->output_size.u32Height,
+				  PIXEL_FORMAT_NV21, DATA_BITWIDTH_8,
+				  COMPRESS_MODE_NONE, DEFAULT_ALIGN, &cal_cfg);
+	ctx->vo_stage_blk = CVI_VB_GetBlock(VB_INVALID_POOLID, cal_cfg.u32VBSize);
+	if (ctx->vo_stage_blk == VB_INVALID_HANDLE) {
+		SAMPLE_PRT("vo stage get vb block failed size=%u\n", cal_cfg.u32VBSize);
+		return CVI_FAILURE;
+	}
+
+	phy_addr = CVI_VB_Handle2PhysAddr(ctx->vo_stage_blk);
+	vir_addr = CVI_SYS_MmapCache(phy_addr, cal_cfg.u32VBSize);
+	if (vir_addr == NULL) {
+		SAMPLE_PRT("vo stage mmap failed phy=%#lx size=%u\n", (unsigned long)phy_addr, cal_cfg.u32VBSize);
+		CVI_VB_ReleaseBlock(ctx->vo_stage_blk);
+		ctx->vo_stage_blk = VB_INVALID_HANDLE;
+		return CVI_FAILURE;
+	}
+
+	chroma_offset = ALIGN(cal_cfg.u32MainYSize, cal_cfg.u16AddrAlign);
+	ctx->vo_stage_mem = vir_addr;
+	ctx->vo_stage_size = cal_cfg.u32VBSize;
+	ctx->stage_frame.u32PoolId = CVI_VB_Handle2PoolId(ctx->vo_stage_blk);
+	ctx->stage_frame.stVFrame.enCompressMode = COMPRESS_MODE_NONE;
+	ctx->stage_frame.stVFrame.enPixelFormat = PIXEL_FORMAT_NV21;
+	ctx->stage_frame.stVFrame.enVideoFormat = VIDEO_FORMAT_LINEAR;
+	ctx->stage_frame.stVFrame.enColorGamut = COLOR_GAMUT_BT601;
+	ctx->stage_frame.stVFrame.enDynamicRange = DYNAMIC_RANGE_SDR8;
+	ctx->stage_frame.stVFrame.u32Width = ctx->output_size.u32Width;
+	ctx->stage_frame.stVFrame.u32Height = ctx->output_size.u32Height;
+	ctx->stage_frame.stVFrame.u32Stride[0] = cal_cfg.u32MainStride;
+	ctx->stage_frame.stVFrame.u32Stride[1] = cal_cfg.u32CStride;
+	ctx->stage_frame.stVFrame.u32Length[0] = cal_cfg.u32MainYSize;
+	ctx->stage_frame.stVFrame.u32Length[1] = cal_cfg.u32MainCSize;
+	ctx->stage_frame.stVFrame.u64PhyAddr[0] = phy_addr;
+	ctx->stage_frame.stVFrame.u64PhyAddr[1] = phy_addr + chroma_offset;
+	ctx->stage_frame.stVFrame.pu8VirAddr[0] = vir_addr;
+	ctx->stage_frame.stVFrame.pu8VirAddr[1] = (CVI_U8 *)vir_addr + chroma_offset;
+	ctx->vo_stage_ready = CVI_TRUE;
+	SAMPLE_PRT("vo stage %ux%u stride=%u/%u phys=%#lx size=%u\n",
+		   ctx->stage_frame.stVFrame.u32Width, ctx->stage_frame.stVFrame.u32Height,
+		   ctx->stage_frame.stVFrame.u32Stride[0], ctx->stage_frame.stVFrame.u32Stride[1],
+		   (unsigned long)ctx->stage_frame.stVFrame.u64PhyAddr[0], ctx->vo_stage_size);
+	return CVI_SUCCESS;
+}
+
+static void vo_stage_close(player_ctx_t *ctx)
+{
+	if (!ctx->vo_stage_ready)
+		return;
+
+	if (ctx->vo_stage_mem != NULL)
+		CVI_SYS_Munmap(ctx->vo_stage_mem, ctx->vo_stage_size);
+	if (ctx->vo_stage_blk != VB_INVALID_HANDLE)
+		CVI_VB_ReleaseBlock(ctx->vo_stage_blk);
+
+	memset(&ctx->stage_frame, 0, sizeof(ctx->stage_frame));
+	ctx->vo_stage_blk = VB_INVALID_HANDLE;
+	ctx->vo_stage_mem = NULL;
+	ctx->vo_stage_size = 0;
+	ctx->vo_stage_ready = CVI_FALSE;
 }
 
 static void init_send_thread_param(vdecChnCtx *chn_ctx, VDEC_THREAD_PARAM_S *param,
@@ -1005,8 +1178,12 @@ static CVI_S32 init_vpss(player_ctx_t *ctx)
 	grp_attr.u8VpssDev = 0;
 
 	chn_enable[PLAYER_VPSS_CHN] = CVI_TRUE;
-	chn_attr[PLAYER_VPSS_CHN].u32Width = ctx->output_size.u32Width;
-	chn_attr[PLAYER_VPSS_CHN].u32Height = ctx->output_size.u32Height;
+	chn_attr[PLAYER_VPSS_CHN].u32Width = (ctx->display_backend == DISPLAY_BACKEND_VO &&
+					      ctx->vo_cpu_pad) ?
+		ctx->content_rect.u32Width : ctx->output_size.u32Width;
+	chn_attr[PLAYER_VPSS_CHN].u32Height = (ctx->display_backend == DISPLAY_BACKEND_VO &&
+					       ctx->vo_cpu_pad) ?
+		ctx->content_rect.u32Height : ctx->output_size.u32Height;
 	chn_attr[PLAYER_VPSS_CHN].enVideoFormat = VIDEO_FORMAT_LINEAR;
 	if (ctx->display_backend == DISPLAY_BACKEND_VO)
 		out_fmt = PIXEL_FORMAT_NV21;
@@ -1018,9 +1195,13 @@ static CVI_S32 init_vpss(player_ctx_t *ctx)
 	chn_attr[PLAYER_VPSS_CHN].u32Depth = 3;
 	chn_attr[PLAYER_VPSS_CHN].bMirror = CVI_FALSE;
 	chn_attr[PLAYER_VPSS_CHN].bFlip = CVI_FALSE;
-	chn_attr[PLAYER_VPSS_CHN].stAspectRatio.enMode = ASPECT_RATIO_AUTO;
+	chn_attr[PLAYER_VPSS_CHN].stAspectRatio.enMode = ASPECT_RATIO_NONE;
 	chn_attr[PLAYER_VPSS_CHN].stAspectRatio.bEnableBgColor = CVI_TRUE;
 	chn_attr[PLAYER_VPSS_CHN].stAspectRatio.u32BgColor = COLOR_RGB_BLACK;
+	chn_attr[PLAYER_VPSS_CHN].stAspectRatio.stVideoRect.s32X = 0;
+	chn_attr[PLAYER_VPSS_CHN].stAspectRatio.stVideoRect.s32Y = 0;
+	chn_attr[PLAYER_VPSS_CHN].stAspectRatio.stVideoRect.u32Width = chn_attr[PLAYER_VPSS_CHN].u32Width;
+	chn_attr[PLAYER_VPSS_CHN].stAspectRatio.stVideoRect.u32Height = chn_attr[PLAYER_VPSS_CHN].u32Height;
 	chn_attr[PLAYER_VPSS_CHN].stNormalize.bEnable = CVI_FALSE;
 
 	ret = SAMPLE_COMM_VPSS_Init(ctx->vpss_grp, chn_enable, &grp_attr, chn_attr);
@@ -1066,10 +1247,40 @@ static CVI_S32 init_vo(player_ctx_t *ctx)
 
 	CHECK_RET(SAMPLE_COMM_VO_StartVO(&ctx->vo_config), "SAMPLE_COMM_VO_StartVO");
 	ctx->vo_started = CVI_TRUE;
+	return CVI_SUCCESS;
+}
+
+static CVI_S32 apply_vo_layout(player_ctx_t *ctx)
+{
+	VO_CHN_ATTR_S chn_attr;
+	CVI_S32 ret;
+
+	memset(&chn_attr, 0, sizeof(chn_attr));
+	chn_attr.u32Priority = 0;
+	if (ctx->vo_cpu_pad) {
+		chn_attr.stRect.s32X = 0;
+		chn_attr.stRect.s32Y = 0;
+		chn_attr.stRect.u32Width = ctx->panel_size.u32Width;
+		chn_attr.stRect.u32Height = ctx->panel_size.u32Height;
+	} else {
+		chn_attr.stRect = ctx->video_rect;
+	}
+
+	CHECK_RET(CVI_VO_DisableChn(ctx->vo_config.VoDev, PLAYER_VO_CHN), "CVI_VO_DisableChn");
+	ret = CVI_VO_SetChnAttr(ctx->vo_config.VoDev, PLAYER_VO_CHN, &chn_attr);
+	if (ret != CVI_SUCCESS) {
+		SAMPLE_PRT("CVI_VO_SetChnAttr layout failed with %#x\n", ret);
+		return ret;
+	}
+	CHECK_RET(CVI_VO_EnableChn(ctx->vo_config.VoDev, PLAYER_VO_CHN), "CVI_VO_EnableChn");
 	if (ctx->rotate_mode == ROTATE_MODE_VO) {
 		CHECK_RET(CVI_VO_SetChnRotation(ctx->vo_config.VoDev, PLAYER_VO_CHN, requested_rotation(ctx)),
 			  "CVI_VO_SetChnRotation");
 	}
+	SAMPLE_PRT("vo rect=%d,%d %ux%u cpu_pad=%d\n",
+		   chn_attr.stRect.s32X, chn_attr.stRect.s32Y,
+		   chn_attr.stRect.u32Width, chn_attr.stRect.u32Height,
+		   ctx->vo_cpu_pad);
 	return CVI_SUCCESS;
 }
 
@@ -1090,8 +1301,6 @@ static CVI_S32 playback_loop_vo_bind(player_ctx_t *ctx)
 	VDEC_THREAD_PARAM_S *send_param = &ctx->vdec_chn.stVdecThreadParamSend;
 	VDEC_CHN_STATUS_S status;
 	CVI_S32 ret;
-	CVI_BOOL warned_no_input = CVI_FALSE;
-
 	gettimeofday(&ctx->start_wall, NULL);
 	ctx->last_status_wall = ctx->start_wall;
 	getrusage(RUSAGE_SELF, &ctx->last_status_usage);
@@ -1107,16 +1316,8 @@ static CVI_S32 playback_loop_vo_bind(player_ctx_t *ctx)
 		ctx->shown_frames = status.u32DecodeStreamFrames;
 		{
 			struct timeval now;
-			double elapsed;
 
 			gettimeofday(&now, NULL);
-			elapsed = timeval_diff_sec(&now, &ctx->start_wall);
-			if (!warned_no_input && elapsed >= 2.0 &&
-			    status.u32RecvStreamFrames == 0 && status.u32DecodeStreamFrames == 0) {
-				SAMPLE_PRT("no bitstream reached VDEC after %.1fs, fileEnd=%d path=%s\n",
-					   elapsed, send_param->bFileEnd, send_param->cFileName);
-				warned_no_input = CVI_TRUE;
-			}
 			if (timeval_diff_sec(&now, &ctx->last_status_wall) >= 0.5)
 				print_status_line(ctx, &status);
 		}
@@ -1145,9 +1346,9 @@ static CVI_S32 playback_loop_vo_sendframe(player_ctx_t *ctx)
 	VDEC_THREAD_PARAM_S *send_param = &ctx->vdec_chn.stVdecThreadParamSend;
 	VIDEO_FRAME_INFO_S vdec_frame;
 	VIDEO_FRAME_INFO_S vo_frame;
+	VIDEO_FRAME_INFO_S *send_frame;
 	VDEC_CHN_STATUS_S status;
 	CVI_S32 ret;
-	CVI_BOOL warned_no_input = CVI_FALSE;
 	CVI_BOOL logged_first_frame = CVI_FALSE;
 	unsigned int idle_loops = 0;
 
@@ -1167,7 +1368,6 @@ static CVI_S32 playback_loop_vo_sendframe(player_ctx_t *ctx)
 					   vdec_frame.stVFrame.enPixelFormat, vdec_frame.stVFrame.u32Stride[0]);
 				logged_first_frame = CVI_TRUE;
 			}
-
 			ret = CVI_VPSS_SendFrame(ctx->vpss_grp, &vdec_frame, 1000);
 			CVI_VDEC_ReleaseFrame(PLAYER_VDEC_CHN, &vdec_frame);
 			memset(&vdec_frame, 0, sizeof(vdec_frame));
@@ -1190,7 +1390,17 @@ static CVI_S32 playback_loop_vo_sendframe(player_ctx_t *ctx)
 					   vo_frame.stVFrame.enPixelFormat, vo_frame.stVFrame.u32Stride[0]);
 			}
 
-			ret = CVI_VO_SendFrame(ctx->vo_config.VoDev, PLAYER_VO_CHN, &vo_frame, 1000);
+			send_frame = &vo_frame;
+			if (ctx->vo_cpu_pad) {
+				ret = build_vo_padded_frame(ctx, &vo_frame, &send_frame);
+				if (ret != CVI_SUCCESS) {
+					CVI_VPSS_ReleaseChnFrame(ctx->vpss_grp, PLAYER_VPSS_CHN, &vo_frame);
+					memset(&vo_frame, 0, sizeof(vo_frame));
+					continue;
+				}
+			}
+
+			ret = CVI_VO_SendFrame(ctx->vo_config.VoDev, PLAYER_VO_CHN, send_frame, 1000);
 			if (ret != CVI_SUCCESS) {
 				SAMPLE_PRT("CVI_VO_SendFrame failed with %#x\n", ret);
 			} else {
@@ -1220,20 +1430,6 @@ static CVI_S32 playback_loop_vo_sendframe(player_ctx_t *ctx)
 			SAMPLE_PRT("CVI_VDEC_GetFrame failed with %#x\n", ret);
 
 		CHECK_RET(CVI_VDEC_QueryStatus(PLAYER_VDEC_CHN, &status), "CVI_VDEC_QueryStatus");
-		{
-			struct timeval now;
-			double elapsed;
-
-			gettimeofday(&now, NULL);
-			elapsed = timeval_diff_sec(&now, &ctx->start_wall);
-			if (!warned_no_input && elapsed >= 2.0 &&
-			    status.u32RecvStreamFrames == 0 && status.u32DecodeStreamFrames == 0) {
-				SAMPLE_PRT("no bitstream reached VDEC after %.1fs, fileEnd=%d path=%s\n",
-					   elapsed, send_param->bFileEnd, send_param->cFileName);
-				warned_no_input = CVI_TRUE;
-			}
-		}
-
 		if (send_param->bFileEnd &&
 		    status.u32LeftStreamBytes == 0 &&
 		    status.u32LeftStreamFrames == 0 &&
@@ -1263,23 +1459,102 @@ static CVI_S32 playback_loop_vo(player_ctx_t *ctx)
 	return playback_loop_vo_sendframe(ctx);
 }
 
-static const unsigned char *map_frame_plane0(const VIDEO_FRAME_S *vframe, CVI_BOOL *mapped)
+static const unsigned char *map_frame_plane(const VIDEO_FRAME_S *vframe, int plane, CVI_BOOL *mapped)
 {
-	if (vframe->pu8VirAddr[0] == NULL) {
-		CVI_SYS_IonInvalidateCache(vframe->u64PhyAddr[0], NULL, vframe->u32Length[0]);
+	if (vframe->pu8VirAddr[plane] == NULL) {
+		CVI_SYS_IonInvalidateCache(vframe->u64PhyAddr[plane], NULL, vframe->u32Length[plane]);
 		*mapped = CVI_TRUE;
-		return CVI_SYS_Mmap(vframe->u64PhyAddr[0], vframe->u32Length[0]);
+		return CVI_SYS_Mmap(vframe->u64PhyAddr[plane], vframe->u32Length[plane]);
 	}
 
-	CVI_SYS_IonInvalidateCache(vframe->u64PhyAddr[0], vframe->pu8VirAddr[0], vframe->u32Length[0]);
+	CVI_SYS_IonInvalidateCache(vframe->u64PhyAddr[plane], vframe->pu8VirAddr[plane], vframe->u32Length[plane]);
 	*mapped = CVI_FALSE;
-	return vframe->pu8VirAddr[0];
+	return vframe->pu8VirAddr[plane];
+}
+
+static const unsigned char *map_frame_plane0(const VIDEO_FRAME_S *vframe, CVI_BOOL *mapped)
+{
+	return map_frame_plane(vframe, 0, mapped);
+}
+
+static void unmap_frame_plane(const VIDEO_FRAME_S *vframe, int plane,
+			      const unsigned char *src_base, CVI_BOOL mapped)
+{
+	if (mapped && src_base != NULL)
+		CVI_SYS_Munmap((void *)src_base, vframe->u32Length[plane]);
 }
 
 static void unmap_frame_plane0(const VIDEO_FRAME_S *vframe, const unsigned char *src_base, CVI_BOOL mapped)
 {
-	if (mapped && src_base != NULL)
-		CVI_SYS_Munmap((void *)src_base, vframe->u32Length[0]);
+	unmap_frame_plane(vframe, 0, src_base, mapped);
+}
+
+static CVI_S32 build_vo_padded_frame(player_ctx_t *ctx, const VIDEO_FRAME_INFO_S *src_frame,
+				     VIDEO_FRAME_INFO_S **out_frame)
+{
+	const VIDEO_FRAME_S *src = &src_frame->stVFrame;
+	VIDEO_FRAME_S *dst = &ctx->stage_frame.stVFrame;
+	const unsigned char *src_y;
+	const unsigned char *src_uv;
+	unsigned char *dst_y;
+	unsigned char *dst_uv;
+	CVI_BOOL src_y_mapped;
+	CVI_BOOL src_uv_mapped;
+	CVI_U32 copy_width;
+	CVI_U32 copy_height;
+	CVI_U32 row;
+
+	if (!ctx->vo_stage_ready) {
+		SAMPLE_PRT("vo stage not ready\n");
+		return CVI_FAILURE;
+	}
+
+	src_y = map_frame_plane(src, 0, &src_y_mapped);
+	src_uv = map_frame_plane(src, 1, &src_uv_mapped);
+	if (src_y == NULL || src_uv == NULL) {
+		SAMPLE_PRT("map source frame failed\n");
+		if (src_y != NULL)
+			unmap_frame_plane(src, 0, src_y, src_y_mapped);
+		if (src_uv != NULL)
+			unmap_frame_plane(src, 1, src_uv, src_uv_mapped);
+		return CVI_FAILURE;
+	}
+
+	dst_y = dst->pu8VirAddr[0];
+	dst_uv = dst->pu8VirAddr[1];
+	memset(dst_y, 0x00, dst->u32Length[0]);
+	memset(dst_uv, 0x80, dst->u32Length[1]);
+
+	copy_width = src->u32Width;
+	if (copy_width > ctx->content_rect.u32Width)
+		copy_width = ctx->content_rect.u32Width;
+	copy_height = src->u32Height;
+	if (copy_height > ctx->content_rect.u32Height)
+		copy_height = ctx->content_rect.u32Height;
+
+	for (row = 0; row < copy_height; ++row) {
+		unsigned char *dst_row = dst_y + (ctx->content_rect.s32Y + row) * dst->u32Stride[0] +
+				 ctx->content_rect.s32X;
+		const unsigned char *src_row = src_y + row * src->u32Stride[0];
+		memcpy(dst_row, src_row, copy_width);
+	}
+
+	for (row = 0; row < (copy_height / 2); ++row) {
+		unsigned char *dst_row = dst_uv + ((ctx->content_rect.s32Y / 2) + row) * dst->u32Stride[1] +
+				 ctx->content_rect.s32X;
+		const unsigned char *src_row = src_uv + row * src->u32Stride[1];
+		memcpy(dst_row, src_row, copy_width);
+	}
+
+	dst->u64PTS = src->u64PTS;
+	dst->u32TimeRef = src->u32TimeRef;
+	CVI_SYS_IonFlushCache(dst->u64PhyAddr[0], dst->pu8VirAddr[0], dst->u32Length[0]);
+	CVI_SYS_IonFlushCache(dst->u64PhyAddr[1], dst->pu8VirAddr[1], dst->u32Length[1]);
+
+	unmap_frame_plane(src, 0, src_y, src_y_mapped);
+	unmap_frame_plane(src, 1, src_uv, src_uv_mapped);
+	*out_frame = &ctx->stage_frame;
+	return CVI_SUCCESS;
 }
 
 static void fill_fb_black_row(const fb_ctx_t *fb, unsigned char *dst)
@@ -1685,6 +1960,7 @@ static void player_stop(player_ctx_t *ctx)
 		ctx->vdec_started = CVI_FALSE;
 	}
 
+	vo_stage_close(ctx);
 	stage_close(ctx);
 	if (ctx->ive_handle != NULL) {
 		CVI_IVE_DestroyHandle(ctx->ive_handle);
@@ -1712,6 +1988,7 @@ int main(int argc, char **argv)
 	ctx.rotate_mode = detect_rotate_mode(ctx.display_backend);
 	ctx.copy_mode = detect_copy_mode();
 	ctx.output_mode = detect_output_mode();
+	ctx.vo_cpu_pad = detect_env_enabled("SAMPLE_VDEC_VO_CPU_PAD", CVI_TRUE);
 	sanitize_rotate_mode(&ctx);
 
 	ret = parseDecArgv(&ctx.input_cfg, argc, argv);
@@ -1726,9 +2003,17 @@ int main(int argc, char **argv)
 		printVdecHelp(argv);
 		return ret;
 	}
+	if (ctx.display_backend != DISPLAY_BACKEND_VO || ctx.vo_path_mode != VO_PATH_MODE_SENDFRAME) {
+		if (ctx.vo_cpu_pad) {
+			SAMPLE_PRT("vo cpu pad only applies to vo/sendframe, disable it for current mode\n");
+			ctx.vo_cpu_pad = CVI_FALSE;
+		}
+	}
 
-	ctx.panel_size.u32Width = PLAYER_PANEL_WIDTH;
-	ctx.panel_size.u32Height = PLAYER_PANEL_HEIGHT;
+	ctx.panel_size.u32Width = align_even_down(
+		detect_env_u32("SAMPLE_VDEC_PANEL_WIDTH", PLAYER_PANEL_WIDTH));
+	ctx.panel_size.u32Height = align_even_down(
+		detect_env_u32("SAMPLE_VDEC_PANEL_HEIGHT", PLAYER_PANEL_HEIGHT));
 
 	if (ctx.display_backend == DISPLAY_BACKEND_FB) {
 		if (fb_open(&ctx.fb, "/dev/fb0") != 0)
@@ -1757,11 +2042,32 @@ int main(int argc, char **argv)
 			ctx.output_size = ctx.panel_size;
 		}
 	}
+	compute_display_layout(&ctx,
+			       ctx.input_cfg.chnInCfg[0].u32BufWidth,
+			       ctx.input_cfg.chnInCfg[0].u32BufHeight);
+	SAMPLE_PRT("display layout src=%ux%u panel=%ux%u rect=%d,%d %ux%u vpss=%ux%u\n",
+		   ctx.input_cfg.chnInCfg[0].u32BufWidth,
+		   ctx.input_cfg.chnInCfg[0].u32BufHeight,
+		   ctx.panel_size.u32Width, ctx.panel_size.u32Height,
+		   ctx.video_rect.s32X, ctx.video_rect.s32Y,
+		   ctx.video_rect.u32Width, ctx.video_rect.u32Height,
+		   ctx.output_size.u32Width, ctx.output_size.u32Height);
+	SAMPLE_PRT("content rect=%d,%d %ux%u vo_cpu_pad=%d\n",
+		   ctx.content_rect.s32X, ctx.content_rect.s32Y,
+		   ctx.content_rect.u32Width, ctx.content_rect.u32Height,
+		   ctx.vo_cpu_pad);
 
 	ret = init_system(&ctx);
 	if (ret != CVI_SUCCESS) {
 		player_stop(&ctx);
 		return ret;
+	}
+	if (ctx.display_backend == DISPLAY_BACKEND_VO && ctx.vo_cpu_pad) {
+		ret = vo_stage_open(&ctx);
+		if (ret != CVI_SUCCESS) {
+			player_stop(&ctx);
+			return ret;
+		}
 	}
 	if (ctx.display_backend == DISPLAY_BACKEND_FB &&
 	    (ctx.copy_mode == COPY_MODE_TDMA || ctx.copy_mode == COPY_MODE_IVE)) {
@@ -1791,6 +2097,11 @@ int main(int argc, char **argv)
 	}
 	if (ctx.display_backend == DISPLAY_BACKEND_VO) {
 		ret = init_vo(&ctx);
+		if (ret != CVI_SUCCESS) {
+			player_stop(&ctx);
+			return ret;
+		}
+		ret = apply_vo_layout(&ctx);
 		if (ret != CVI_SUCCESS) {
 			player_stop(&ctx);
 			return ret;
@@ -1828,10 +2139,12 @@ int main(int argc, char **argv)
 			   output_mode_name(ctx.output_mode));
 		ret = playback_loop(&ctx);
 	} else {
-		SAMPLE_PRT("vo playback start: %s -> panel=%ux%u vpss=%ux%u backend=%s rotate=%s path=%s\n",
+		SAMPLE_PRT("vo playback start: %s -> panel=%ux%u vpss=%ux%u rect=%d,%d %ux%u backend=%s rotate=%s path=%s\n",
 			   ctx.input_cfg.chnInCfg[0].input_path,
 			   ctx.panel_size.u32Width, ctx.panel_size.u32Height,
 			   ctx.output_size.u32Width, ctx.output_size.u32Height,
+			   ctx.video_rect.s32X, ctx.video_rect.s32Y,
+			   ctx.video_rect.u32Width, ctx.video_rect.u32Height,
 			   display_backend_name(ctx.display_backend),
 			   rotate_mode_name(ctx.rotate_mode),
 			   vo_path_mode_name(ctx.vo_path_mode));
