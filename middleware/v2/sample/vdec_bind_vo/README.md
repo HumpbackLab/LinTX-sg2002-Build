@@ -82,6 +82,12 @@ This is enough to display standard horizontal content such as a `1280x720` test 
 - the playback path is tuned for the current board/panel assumption and is not a generic sample
 - the implementation is functional first, not optimized
 
+Recent experiment notes:
+
+- trying `VPSS` channel output as `ARGB_8888` currently fails on this SDK / board path during channel setup
+- adding a `TDMA`-assisted final copy via an intermediate `ARGB_8888` stage buffer runs, but does not materially change the observed `~4.4fps` / `~98% CPU` baseline
+- current evidence says the main cost is still CPU-side frame preparation before the last framebuffer move
+
 ## Recommended Test Input
 
 For current testing, use a standard horizontal source such as:
