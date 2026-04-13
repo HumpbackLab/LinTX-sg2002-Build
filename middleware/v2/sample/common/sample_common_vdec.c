@@ -575,13 +575,26 @@ CVI_VOID SAMPLE_COMM_VDEC_StartSendStream(VDEC_THREAD_PARAM_S *pstVdecSend,
 {
 	struct sched_param param;
 	pthread_attr_t attr;
+	CVI_S32 ret;
 
 	param.sched_priority = 80;
 	pthread_attr_init(&attr);
 	pthread_attr_setschedpolicy(&attr, SCHED_RR);
 	pthread_attr_setschedparam(&attr, &param);
 	pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
-	pthread_create(pVdecThread, &attr, SAMPLE_COMM_VDEC_SendStream, (CVI_VOID *)pstVdecSend);
+	ret = pthread_create(pVdecThread, &attr, SAMPLE_COMM_VDEC_SendStream, (CVI_VOID *)pstVdecSend);
+	pthread_attr_destroy(&attr);
+	if (ret == 0)
+		return;
+
+	CVI_VDEC_WARN("pthread_create with SCHED_RR failed for chn %d: %s, fallback to default thread attr\n",
+		      pstVdecSend->s32ChnId, strerror(ret));
+	ret = pthread_create(pVdecThread, NULL, SAMPLE_COMM_VDEC_SendStream, (CVI_VOID *)pstVdecSend);
+	if (ret != 0) {
+		CVI_VDEC_ERR("pthread_create fallback failed for chn %d: %s\n",
+			     pstVdecSend->s32ChnId, strerror(ret));
+		*pVdecThread = 0;
+	}
 }
 
 CVI_VOID SAMPLE_COMM_VDEC_StopSendStream(VDEC_THREAD_PARAM_S *pstVdecSend, pthread_t *pVdecThread)
