@@ -3,6 +3,7 @@
 #include <linux/fb.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,7 @@
 #include <sys/time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #include "sample_comm.h"
@@ -19,6 +21,10 @@
 
 #define PLAYER_VDEC_CHN 0
 #define PLAYER_VPSS_CHN 0
+#define PLAYER_VO_CHN 0
+#define PLAYER_PANEL_WIDTH 480
+#define PLAYER_PANEL_HEIGHT 800
+#define PLAYER_VDEC_NO_FRAME_RET ((CVI_S32)0xC0058041)
 
 #pragma weak CVI_VDEC_SetRotation
 
@@ -26,6 +32,8 @@ typedef enum rotate_mode_e {
 	ROTATE_MODE_CPU = 0,
 	ROTATE_MODE_VDEC = 1,
 	ROTATE_MODE_NONE = 2,
+	ROTATE_MODE_VO = 3,
+	ROTATE_MODE_VPSS = 4,
 } rotate_mode_t;
 
 typedef enum copy_mode_e {
@@ -38,6 +46,16 @@ typedef enum output_mode_e {
 	OUTPUT_MODE_BGR888 = 0,
 	OUTPUT_MODE_ARGB8888 = 1,
 } output_mode_t;
+
+typedef enum display_backend_e {
+	DISPLAY_BACKEND_VO = 0,
+	DISPLAY_BACKEND_FB = 1,
+} display_backend_t;
+
+typedef enum vo_path_mode_e {
+	VO_PATH_MODE_SENDFRAME = 0,
+	VO_PATH_MODE_BIND = 1,
+} vo_path_mode_t;
 
 typedef struct fb_ctx_s {
 	int fd;
@@ -56,15 +74,22 @@ typedef struct player_ctx_s {
 	fb_ctx_t fb;
 	fb_ctx_t stage_fb;
 	VIDEO_FRAME_INFO_S stage_frame;
+	SIZE_S panel_size;
 	SIZE_S output_size;
 	VPSS_GRP vpss_grp;
+	SAMPLE_VO_CONFIG_S vo_config;
 	rotate_mode_t rotate_mode;
 	copy_mode_t copy_mode;
 	output_mode_t output_mode;
+	display_backend_t display_backend;
+	vo_path_mode_t vo_path_mode;
 	IVE_HANDLE ive_handle;
 	CVI_BOOL sys_inited;
 	CVI_BOOL vdec_started;
 	CVI_BOOL vpss_started;
+	CVI_BOOL vo_started;
+	CVI_BOOL vdec_vpss_bound;
+	CVI_BOOL vpss_vo_bound;
 	CVI_BOOL stage_ready;
 	CVI_U64 shown_frames;
 	CVI_U64 getframe_timeouts;
@@ -83,8 +108,284 @@ typedef struct player_ctx_s {
 
 static volatile sig_atomic_t g_stop_requested = 0;
 
+static CVI_VOID *player_send_stream_thread(CVI_VOID *pArgs)
+{
+	VDEC_THREAD_PARAM_S *param = (VDEC_THREAD_PARAM_S *)pArgs;
+	CVI_BOOL b_end_of_stream = CVI_FALSE;
+	CVI_BOOL b_find_start;
+	CVI_BOOL b_find_end;
+	CVI_U8 *buf = NULL;
+	CVI_U64 pts;
+	CVI_U32 start_offset;
+	CVI_U32 jpeg_len;
+	CVI_S32 used_bytes = 0;
+	CVI_S32 read_len = 0;
+	CVI_S32 ret;
+	CVI_S32 i;
+	CVI_S32 send_count = 0;
+	CVI_S32 retry_count = 0;
+	FILE *fp = NULL;
+	VDEC_STREAM_S stream;
+
+	prctl(PR_SET_NAME, "VideoSendStream", 0, 0, 0);
+	SAMPLE_PRT("send thread start chn=%d file=%s timeout=%d buf=%d mode=%d type=%d\n",
+		   param->s32ChnId, param->cFileName, param->s32MilliSec,
+		   param->s32MinBufSize, param->s32StreamMode, param->enType);
+
+	fp = fopen(param->cFileName, "rb");
+	if (fp == NULL) {
+		SAMPLE_PRT("send thread fopen failed chn=%d file=%s err=%s\n",
+			   param->s32ChnId, param->cFileName, strerror(errno));
+		param->bFileEnd = CVI_TRUE;
+		return (CVI_VOID *)(uintptr_t)CVI_FAILURE;
+	}
+	SAMPLE_PRT("send thread fopen ok chn=%d file=%s\n", param->s32ChnId, param->cFileName);
+
+	buf = malloc(param->s32MinBufSize);
+	if (buf == NULL) {
+		SAMPLE_PRT("send thread malloc failed chn=%d size=%d\n",
+			   param->s32ChnId, param->s32MinBufSize);
+		fclose(fp);
+		param->bFileEnd = CVI_TRUE;
+		return (CVI_VOID *)(uintptr_t)CVI_FAILURE;
+	}
+
+	pts = param->u64PtsInit;
+	while (1) {
+		if (param->eThreadCtrl == THREAD_CTRL_STOP) {
+			SAMPLE_PRT("send thread stop requested chn=%d\n", param->s32ChnId);
+			break;
+		}
+		if (param->eThreadCtrl == THREAD_CTRL_PAUSE) {
+			usleep(100000);
+			continue;
+		}
+
+		b_end_of_stream = CVI_FALSE;
+		b_find_start = CVI_FALSE;
+		b_find_end = CVI_FALSE;
+		start_offset = 0;
+
+		if (fseek(fp, used_bytes, SEEK_SET) != 0) {
+			SAMPLE_PRT("send thread fseek failed chn=%d used=%d err=%s\n",
+				   param->s32ChnId, used_bytes, strerror(errno));
+			break;
+		}
+
+		read_len = fread(buf, 1, param->s32MinBufSize, fp);
+		if (send_count < 3)
+			SAMPLE_PRT("send thread read chn=%d used=%d len=%d\n",
+				   param->s32ChnId, used_bytes, read_len);
+
+		if (read_len == 0) {
+			if (param->bCircleSend == CVI_TRUE) {
+				memset(&stream, 0, sizeof(stream));
+				stream.bEndOfStream = CVI_TRUE;
+				ret = CVI_VDEC_SendStream(param->s32ChnId, &stream, 1000);
+				SAMPLE_PRT("send thread loop eos chn=%d ret=%#x\n",
+					   param->s32ChnId, ret);
+				if (ret != CVI_SUCCESS && ret != CVI_ERR_VDEC_BUSY)
+					break;
+				used_bytes = 0;
+				fseek(fp, 0, SEEK_SET);
+				read_len = fread(buf, 1, param->s32MinBufSize, fp);
+			} else {
+				SAMPLE_PRT("send thread eof chn=%d used=%d sends=%d\n",
+					   param->s32ChnId, used_bytes, send_count);
+				break;
+			}
+		}
+
+		if (param->s32StreamMode == VIDEO_MODE_FRAME && param->enType == PT_H264) {
+			for (i = 0; i < read_len - 8; i++) {
+				int tmp = buf[i + 3] & 0x1F;
+
+				if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 &&
+				    (((tmp == 0x5 || tmp == 0x1) && ((buf[i + 4] & 0x80) == 0x80)) ||
+				     (tmp == 20 && (buf[i + 7] & 0x80) == 0x80))) {
+					b_find_start = CVI_TRUE;
+					i += 8;
+					break;
+				}
+			}
+
+			for (; i < read_len - 8; i++) {
+				int tmp = buf[i + 3] & 0x1F;
+
+				if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 &&
+				    (tmp == 15 || tmp == 7 || tmp == 8 || tmp == 6 ||
+				     ((tmp == 5 || tmp == 1) && ((buf[i + 4] & 0x80) == 0x80)) ||
+				     (tmp == 20 && (buf[i + 7] & 0x80) == 0x80))) {
+					b_find_end = CVI_TRUE;
+					break;
+				}
+			}
+
+			if (i > 0)
+				read_len = i;
+			if (!b_find_start) {
+				SAMPLE_PRT("send thread no H264 start chn=%d used=%d len=%d\n",
+					   param->s32ChnId, used_bytes, read_len);
+			}
+			if (!b_find_end)
+				read_len = i + 8;
+		} else if (param->s32StreamMode == VIDEO_MODE_FRAME && param->enType == PT_H265) {
+			CVI_BOOL b_new_pic = CVI_FALSE;
+
+			for (i = 0; i < read_len - 6; i++) {
+				CVI_U32 tmp = (buf[i + 3] & 0x7E) >> 1;
+
+				b_new_pic = (buf[i + 0] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 &&
+					     (tmp <= 21) && ((buf[i + 5] & 0x80) == 0x80));
+				if (b_new_pic) {
+					b_find_start = CVI_TRUE;
+					i += 6;
+					break;
+				}
+			}
+
+			for (; i < read_len - 6; i++) {
+				CVI_U32 tmp = (buf[i + 3] & 0x7E) >> 1;
+
+				b_new_pic = (buf[i + 0] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 &&
+					     (tmp == 32 || tmp == 33 || tmp == 34 || tmp == 39 || tmp == 40 ||
+					      ((tmp <= 21) && (buf[i + 5] & 0x80) == 0x80)));
+				if (b_new_pic) {
+					b_find_end = CVI_TRUE;
+					break;
+				}
+			}
+
+			if (i > 0)
+				read_len = i;
+			if (!b_find_start) {
+				SAMPLE_PRT("send thread no H265 start chn=%d used=%d len=%d\n",
+					   param->s32ChnId, used_bytes, read_len);
+			}
+			if (!b_find_end)
+				read_len = i + 6;
+		} else if (param->enType == PT_MJPEG || param->enType == PT_JPEG) {
+			for (i = 0; i < read_len - 1; i++) {
+				if (buf[i] == 0xFF && buf[i + 1] == 0xD8) {
+					start_offset = i;
+					b_find_start = CVI_TRUE;
+					i += 2;
+					break;
+				}
+			}
+
+			for (; i < read_len - 3; i++) {
+				if (buf[i] == 0xFF && (buf[i + 1] & 0xF0) == 0xE0) {
+					jpeg_len = (buf[i + 2] << 8) + buf[i + 3];
+					i += 1 + jpeg_len;
+				} else {
+					break;
+				}
+			}
+
+			for (; i < read_len - 1; i++) {
+				if (buf[i] == 0xFF && buf[i + 1] == 0xD9) {
+					b_find_end = CVI_TRUE;
+					break;
+				}
+			}
+			read_len = i + 2;
+			if (!b_find_start) {
+				SAMPLE_PRT("send thread no JPEG start chn=%d used=%d len=%d\n",
+					   param->s32ChnId, used_bytes, read_len);
+			}
+		} else if (read_len < param->s32MinBufSize) {
+			b_end_of_stream = CVI_TRUE;
+		}
+
+		memset(&stream, 0, sizeof(stream));
+		stream.u64PTS = pts;
+		stream.pu8Addr = buf + start_offset;
+		stream.u32Len = read_len;
+		stream.bEndOfFrame = (param->s32StreamMode == VIDEO_MODE_FRAME) ? CVI_TRUE : CVI_FALSE;
+		stream.bEndOfStream = b_end_of_stream;
+		stream.bDisplay = 1;
+
+		retry_count = 0;
+		while (param->eThreadCtrl == THREAD_CTRL_START) {
+			ret = CVI_VDEC_SendStream(param->s32ChnId, &stream, param->s32MilliSec);
+			if (ret == CVI_SUCCESS) {
+				if (send_count < 5 || retry_count > 0) {
+					SAMPLE_PRT("send thread ok chn=%d send=%d used=%d len=%u retries=%d eos=%d\n",
+						   param->s32ChnId, send_count, used_bytes, stream.u32Len,
+						   retry_count, stream.bEndOfStream);
+				}
+				break;
+			}
+
+			retry_count++;
+			if (retry_count <= 5 || (retry_count % 20) == 0) {
+				SAMPLE_PRT("send thread CVI_VDEC_SendStream chn=%d ret=%#x used=%d len=%u retry=%d\n",
+					   param->s32ChnId, ret, used_bytes, stream.u32Len, retry_count);
+			}
+			if (ret != CVI_ERR_VDEC_BUSY)
+				usleep(10000);
+			usleep(param->s32IntervalTime);
+		}
+
+		if (ret != CVI_SUCCESS)
+			break;
+
+		send_count++;
+		used_bytes += read_len + start_offset;
+		pts += param->u64PtsIncrease;
+		usleep(param->s32IntervalTime);
+	}
+
+	memset(&stream, 0, sizeof(stream));
+	stream.bEndOfStream = CVI_TRUE;
+	ret = CVI_VDEC_SendStream(param->s32ChnId, &stream, 1000);
+	SAMPLE_PRT("send thread final eos chn=%d ret=%#x sends=%d\n",
+		   param->s32ChnId, ret, send_count);
+	param->bFileEnd = CVI_TRUE;
+	if (buf != NULL)
+		free(buf);
+	if (fp != NULL)
+		fclose(fp);
+	SAMPLE_PRT("send thread exit chn=%d fileEnd=%d sends=%d used=%d\n",
+		   param->s32ChnId, param->bFileEnd, send_count, used_bytes);
+	return (CVI_VOID *)(uintptr_t)CVI_SUCCESS;
+}
+
+static void player_start_send_stream(VDEC_THREAD_PARAM_S *pstVdecSend,
+				     pthread_t *pVdecThread)
+{
+	struct sched_param param;
+	pthread_attr_t attr;
+	int ret;
+
+	param.sched_priority = 80;
+	pthread_attr_init(&attr);
+	pthread_attr_setschedpolicy(&attr, SCHED_RR);
+	pthread_attr_setschedparam(&attr, &param);
+	pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+
+	ret = pthread_create(pVdecThread, &attr, player_send_stream_thread, (CVI_VOID *)pstVdecSend);
+	pthread_attr_destroy(&attr);
+	if (ret == 0)
+		return;
+
+	SAMPLE_PRT("pthread_create SCHED_RR failed for chn %d: %s, fallback to default attr\n",
+		   pstVdecSend->s32ChnId, strerror(ret));
+	ret = pthread_create(pVdecThread, NULL, player_send_stream_thread, (CVI_VOID *)pstVdecSend);
+	if (ret != 0) {
+		SAMPLE_PRT("pthread_create fallback failed for chn %d: %s\n",
+			   pstVdecSend->s32ChnId, strerror(ret));
+		*pVdecThread = 0;
+	}
+}
+
 static const char *rotate_mode_name(rotate_mode_t mode)
 {
+	if (mode == ROTATE_MODE_VO)
+		return "vo";
+	if (mode == ROTATE_MODE_VPSS)
+		return "vpss";
 	if (mode == ROTATE_MODE_VDEC)
 		return "vdec";
 	if (mode == ROTATE_MODE_NONE)
@@ -106,16 +407,68 @@ static const char *output_mode_name(output_mode_t mode)
 	return (mode == OUTPUT_MODE_ARGB8888) ? "argb8888" : "bgr888";
 }
 
-static rotate_mode_t detect_rotate_mode(void)
+static const char *vpss_output_name(const player_ctx_t *ctx)
 {
-	const char *mode = getenv("SAMPLE_VDEC_FB_ROTATE_MODE");
+	if (ctx->display_backend == DISPLAY_BACKEND_VO)
+		return "nv21";
+	return output_mode_name(ctx->output_mode);
+}
+
+static const char *display_backend_name(display_backend_t backend)
+{
+	return (backend == DISPLAY_BACKEND_FB) ? "fb" : "vo";
+}
+
+static const char *vo_path_mode_name(vo_path_mode_t mode)
+{
+	return (mode == VO_PATH_MODE_BIND) ? "bind" : "sendframe";
+}
+
+static display_backend_t detect_display_backend(void)
+{
+	const char *mode = getenv("SAMPLE_VDEC_DISPLAY_BACKEND");
+
+	if (mode != NULL && strcmp(mode, "fb") == 0)
+		return DISPLAY_BACKEND_FB;
+	if (mode != NULL && strcmp(mode, "vo") == 0)
+		return DISPLAY_BACKEND_VO;
+	if (getenv("SAMPLE_VDEC_FB_ROTATE_MODE") != NULL ||
+	    getenv("SAMPLE_VDEC_FB_COPY_MODE") != NULL ||
+	    getenv("SAMPLE_VDEC_FB_OUTPUT_MODE") != NULL)
+		return DISPLAY_BACKEND_FB;
+
+	return DISPLAY_BACKEND_VO;
+}
+
+static vo_path_mode_t detect_vo_path_mode(void)
+{
+	const char *mode = getenv("SAMPLE_VDEC_VO_PATH");
+
+	if (mode != NULL && strcmp(mode, "bind") == 0)
+		return VO_PATH_MODE_BIND;
+	return VO_PATH_MODE_SENDFRAME;
+}
+
+static rotate_mode_t detect_rotate_mode(display_backend_t backend)
+{
+	const char *mode = getenv("SAMPLE_VDEC_BIND_ROTATE_MODE");
+
+	if (mode == NULL)
+		mode = getenv("SAMPLE_VDEC_FB_ROTATE_MODE");
+
+	if (mode != NULL && strcmp(mode, "vo") == 0)
+		return ROTATE_MODE_VO;
+	if (mode != NULL && strcmp(mode, "vpss") == 0)
+		return ROTATE_MODE_VPSS;
+	if (mode != NULL && strcmp(mode, "cpu") == 0)
+		return ROTATE_MODE_CPU;
 
 	if (mode != NULL && strcmp(mode, "vdec") == 0)
 		return ROTATE_MODE_VDEC;
 	if (mode != NULL && strcmp(mode, "none") == 0)
 		return ROTATE_MODE_NONE;
 
-	return ROTATE_MODE_CPU;
+	return (backend == DISPLAY_BACKEND_FB) ? ROTATE_MODE_CPU : ROTATE_MODE_VO;
 }
 
 static copy_mode_t detect_copy_mode(void)
@@ -140,16 +493,44 @@ static output_mode_t detect_output_mode(void)
 	return OUTPUT_MODE_BGR888;
 }
 
+static ROTATION_E requested_rotation(const player_ctx_t *ctx)
+{
+	(void)ctx;
+	return ROTATION_270;
+}
+
 static void sanitize_rotate_mode(player_ctx_t *ctx)
 {
+	if (ctx->display_backend == DISPLAY_BACKEND_FB) {
+		if (ctx->rotate_mode == ROTATE_MODE_VO || ctx->rotate_mode == ROTATE_MODE_VPSS) {
+			SAMPLE_PRT("fb backend does not use VO/VPSS rotation, fallback to cpu rotate\n");
+			ctx->rotate_mode = ROTATE_MODE_CPU;
+		}
+		if (ctx->rotate_mode == ROTATE_MODE_VDEC && CVI_VDEC_SetRotation == NULL) {
+			SAMPLE_PRT("CVI_VDEC_SetRotation not exported by current SDK, fallback to cpu rotate\n");
+			ctx->rotate_mode = ROTATE_MODE_CPU;
+		}
+		return;
+	}
+
+	if (ctx->rotate_mode == ROTATE_MODE_CPU) {
+		SAMPLE_PRT("vo backend does not use cpu rotation, fallback to vo rotation\n");
+		ctx->rotate_mode = ROTATE_MODE_VO;
+		return;
+	}
 	if (ctx->rotate_mode == ROTATE_MODE_VDEC && CVI_VDEC_SetRotation == NULL) {
-		SAMPLE_PRT("CVI_VDEC_SetRotation not exported by current SDK, fallback to cpu rotate\n");
-		ctx->rotate_mode = ROTATE_MODE_CPU;
+		SAMPLE_PRT("CVI_VDEC_SetRotation not exported by current SDK, fallback to vo rotation\n");
+		ctx->rotate_mode = ROTATE_MODE_VO;
 	}
 }
 
 static void sanitize_copy_mode(player_ctx_t *ctx)
 {
+	if (ctx->display_backend != DISPLAY_BACKEND_FB) {
+		ctx->copy_mode = COPY_MODE_CPU;
+		return;
+	}
+
 	if (ctx->copy_mode != COPY_MODE_TDMA)
 		return;
 
@@ -185,6 +566,11 @@ static double avg_ms_per_frame(double total_sec, CVI_U64 shown_frames)
 	if (shown_frames == 0)
 		return 0.0;
 	return (total_sec * 1000.0) / (double)shown_frames;
+}
+
+static CVI_BOOL is_vdec_getframe_idle_ret(CVI_S32 ret)
+{
+	return (ret == CVI_ERR_VDEC_BUSY || ret == PLAYER_VDEC_NO_FRAME_RET);
 }
 
 static void print_status_line(player_ctx_t *ctx, const VDEC_CHN_STATUS_S *status)
@@ -444,8 +830,8 @@ static void init_send_thread_param(vdecChnCtx *chn_ctx, VDEC_THREAD_PARAM_S *par
 	param->u64PtsIncrease = 0;
 	param->eThreadCtrl = THREAD_CTRL_START;
 	param->bCircleSend = CVI_FALSE;
-	param->s32MilliSec = timeout_ms;
-	param->s32MinBufSize = 50 * 1024;
+	param->s32MilliSec = (timeout_ms < 0) ? 1000 : timeout_ms;
+	param->s32MinBufSize = (attr->u32Width * attr->u32Height * 3) >> 1;
 	param->bFileEnd = CVI_FALSE;
 }
 
@@ -473,8 +859,20 @@ static CVI_S32 validate_config(vdecInputCfg *cfg)
 		chn_cfg->u32BufWidth = 1920;
 	if (chn_cfg->u32BufHeight == 0)
 		chn_cfg->u32BufHeight = 1080;
+	if (chn_cfg->u32BufWidth >= 640 && chn_cfg->u32BufHeight > 0 && chn_cfg->u32BufHeight < 128) {
+		SAMPLE_PRT("suspicious decode buffer size %ux%u, force fallback to 1920x1080\n",
+			   chn_cfg->u32BufWidth, chn_cfg->u32BufHeight);
+		if (chn_cfg->u32BufWidth < 1920)
+			chn_cfg->u32BufWidth = 1920;
+		chn_cfg->u32BufHeight = 1080;
+	}
 	if (chn_cfg->u32MaxFrameBuffer == 0)
-		chn_cfg->u32MaxFrameBuffer = 4;
+		chn_cfg->u32MaxFrameBuffer = 8;
+
+	SAMPLE_PRT("validated config codec=%d input=%s buf=%ux%u maxframe=%u send_to=%d get_to=%d\n",
+		   chn_cfg->enType, chn_cfg->input_path, chn_cfg->u32BufWidth, chn_cfg->u32BufHeight,
+		   chn_cfg->u32MaxFrameBuffer, chn_cfg->s32sendstream_timeout,
+		   chn_cfg->s32getframe_timeout);
 
 	return CVI_SUCCESS;
 }
@@ -485,26 +883,43 @@ static CVI_S32 init_system(player_ctx_t *ctx)
 	vdecChnInputCfg *chn_cfg = &ctx->input_cfg.chnInCfg[0];
 	CVI_U32 decode_blk_size;
 	CVI_U32 display_blk_size;
+	CVI_U32 decode_blk_cnt;
+	CVI_U32 display_blk_cnt;
+	PIXEL_FORMAT_E display_fmt;
 
 	memset(&vb_conf, 0, sizeof(vb_conf));
 	decode_blk_size = COMMON_GetPicBufferSize(chn_cfg->u32BufWidth, chn_cfg->u32BufHeight,
 						  PIXEL_FORMAT_NV21, DATA_BITWIDTH_8,
 						  COMPRESS_MODE_NONE, DEFAULT_ALIGN);
+	if (ctx->display_backend == DISPLAY_BACKEND_VO)
+		display_fmt = PIXEL_FORMAT_NV21;
+	else if (ctx->output_mode == OUTPUT_MODE_ARGB8888)
+		display_fmt = PIXEL_FORMAT_ARGB_8888;
+	else
+		display_fmt = PIXEL_FORMAT_BGR_888;
 	display_blk_size = COMMON_GetPicBufferSize(ctx->output_size.u32Width,
 						   ctx->output_size.u32Height,
-						   PIXEL_FORMAT_RGB_888,
+						   display_fmt,
 						   DATA_BITWIDTH_8,
 						   COMPRESS_MODE_NONE,
 						   DEFAULT_ALIGN);
+	decode_blk_cnt = chn_cfg->u32MaxFrameBuffer + 2;
+	if (decode_blk_cnt < 8)
+		decode_blk_cnt = 8;
+	display_blk_cnt = 6;
+	if (ctx->display_backend == DISPLAY_BACKEND_FB)
+		display_blk_cnt = 4;
 
 	vb_conf.u32MaxPoolCnt = 2;
 	vb_conf.astCommPool[0].u32BlkSize = decode_blk_size;
-	vb_conf.astCommPool[0].u32BlkCnt = 4;
+	vb_conf.astCommPool[0].u32BlkCnt = decode_blk_cnt;
 	vb_conf.astCommPool[0].enRemapMode = VB_REMAP_MODE_CACHED;
 	vb_conf.astCommPool[1].u32BlkSize = display_blk_size;
-	vb_conf.astCommPool[1].u32BlkCnt = 4;
+	vb_conf.astCommPool[1].u32BlkCnt = display_blk_cnt;
 	vb_conf.astCommPool[1].enRemapMode = VB_REMAP_MODE_CACHED;
 
+	SAMPLE_PRT("VB config decode_blk=%u x %u display_blk=%u x %u\n",
+		   decode_blk_size, decode_blk_cnt, display_blk_size, display_blk_cnt);
 	CHECK_RET(SAMPLE_COMM_SYS_Init(&vb_conf), "SAMPLE_COMM_SYS_Init");
 	ctx->sys_inited = CVI_TRUE;
 	return CVI_SUCCESS;
@@ -530,7 +945,7 @@ static CVI_S32 init_vdec(player_ctx_t *ctx)
 	chn_ctx->stSampleVdecAttr.u32Width = chn_cfg->u32BufWidth;
 	chn_ctx->stSampleVdecAttr.u32Height = chn_cfg->u32BufHeight;
 	chn_ctx->stSampleVdecAttr.u32FrameBufCnt = chn_cfg->u32MaxFrameBuffer;
-	chn_ctx->stSampleVdecAttr.u32DisplayFrameNum = 1;
+	chn_ctx->stSampleVdecAttr.u32DisplayFrameNum = 3;
 
 	chn_attr.enType = en_type;
 	chn_attr.enMode = VIDEO_MODE_FRAME;
@@ -544,15 +959,18 @@ static CVI_S32 init_vdec(player_ctx_t *ctx)
 	CHECK_RET(CVI_VDEC_GetChnParam(PLAYER_VDEC_CHN, &chn_param), "CVI_VDEC_GetChnParam");
 	chn_param.enType = en_type;
 	chn_param.enPixelFormat = PIXEL_FORMAT_NV21;
-	chn_param.u32DisplayFrameNum = 1;
+	chn_param.u32DisplayFrameNum = 3;
+	SAMPLE_PRT("init_vdec width=%u height=%u frameBufCnt=%u displayFrameNum=%u streamBuf=%u\n",
+		   chn_attr.u32PicWidth, chn_attr.u32PicHeight, chn_attr.u32FrameBufCnt,
+		   chn_param.u32DisplayFrameNum, chn_attr.u32StreamBufSize);
 	CHECK_RET(CVI_VDEC_SetChnParam(PLAYER_VDEC_CHN, &chn_param), "CVI_VDEC_SetChnParam");
 	if (ctx->rotate_mode == ROTATE_MODE_VDEC) {
-		ret = CVI_VDEC_SetRotation(PLAYER_VDEC_CHN, ROTATION_270);
+		ret = CVI_VDEC_SetRotation(PLAYER_VDEC_CHN, requested_rotation(ctx));
 		if (ret != CVI_SUCCESS) {
-			SAMPLE_PRT("CVI_VDEC_SetRotation(270) failed with %#x\n", ret);
+			SAMPLE_PRT("CVI_VDEC_SetRotation failed with %#x\n", ret);
 			return ret;
 		}
-		SAMPLE_PRT("using VDEC rotate270 path\n");
+		SAMPLE_PRT("using VDEC rotation path\n");
 	}
 	CHECK_RET(CVI_VDEC_StartRecvStream(PLAYER_VDEC_CHN), "CVI_VDEC_StartRecvStream");
 	ctx->vdec_started = CVI_TRUE;
@@ -590,7 +1008,10 @@ static CVI_S32 init_vpss(player_ctx_t *ctx)
 	chn_attr[PLAYER_VPSS_CHN].u32Width = ctx->output_size.u32Width;
 	chn_attr[PLAYER_VPSS_CHN].u32Height = ctx->output_size.u32Height;
 	chn_attr[PLAYER_VPSS_CHN].enVideoFormat = VIDEO_FORMAT_LINEAR;
-	out_fmt = (ctx->output_mode == OUTPUT_MODE_ARGB8888) ? PIXEL_FORMAT_ARGB_8888 : PIXEL_FORMAT_BGR_888;
+	if (ctx->display_backend == DISPLAY_BACKEND_VO)
+		out_fmt = PIXEL_FORMAT_NV21;
+	else
+		out_fmt = (ctx->output_mode == OUTPUT_MODE_ARGB8888) ? PIXEL_FORMAT_ARGB_8888 : PIXEL_FORMAT_BGR_888;
 	chn_attr[PLAYER_VPSS_CHN].enPixelFormat = out_fmt;
 	chn_attr[PLAYER_VPSS_CHN].stFrameRate.s32SrcFrameRate = -1;
 	chn_attr[PLAYER_VPSS_CHN].stFrameRate.s32DstFrameRate = -1;
@@ -603,7 +1024,8 @@ static CVI_S32 init_vpss(player_ctx_t *ctx)
 	chn_attr[PLAYER_VPSS_CHN].stNormalize.bEnable = CVI_FALSE;
 
 	ret = SAMPLE_COMM_VPSS_Init(ctx->vpss_grp, chn_enable, &grp_attr, chn_attr);
-	if (ret != CVI_SUCCESS && ctx->output_mode == OUTPUT_MODE_ARGB8888) {
+	if (ret != CVI_SUCCESS && ctx->display_backend == DISPLAY_BACKEND_FB &&
+	    ctx->output_mode == OUTPUT_MODE_ARGB8888) {
 		SAMPLE_PRT("VPSS argb8888 output failed with %#x, fallback to bgr888\n", ret);
 		ctx->output_mode = OUTPUT_MODE_BGR888;
 		chn_attr[PLAYER_VPSS_CHN].enPixelFormat = PIXEL_FORMAT_BGR_888;
@@ -612,9 +1034,233 @@ static CVI_S32 init_vpss(player_ctx_t *ctx)
 	CHECK_RET(ret, "SAMPLE_COMM_VPSS_Init");
 	CHECK_RET(SAMPLE_COMM_VPSS_Start(ctx->vpss_grp, chn_enable, &grp_attr, chn_attr),
 		  "SAMPLE_COMM_VPSS_Start");
-	SAMPLE_PRT("using VPSS grp %d output=%s\n", ctx->vpss_grp, output_mode_name(ctx->output_mode));
+	if (ctx->rotate_mode == ROTATE_MODE_VPSS) {
+		CHECK_RET(CVI_VPSS_SetChnRotation(ctx->vpss_grp, PLAYER_VPSS_CHN, requested_rotation(ctx)),
+			  "CVI_VPSS_SetChnRotation");
+	}
+	SAMPLE_PRT("using VPSS grp %d output=%s\n", ctx->vpss_grp, vpss_output_name(ctx));
 	ctx->vpss_started = CVI_TRUE;
 	return CVI_SUCCESS;
+}
+
+static CVI_S32 init_vo(player_ctx_t *ctx)
+{
+	CVI_S32 ret;
+
+	memset(&ctx->vo_config, 0, sizeof(ctx->vo_config));
+	ret = SAMPLE_COMM_VO_GetDefConfig(&ctx->vo_config);
+	if (ret != CVI_SUCCESS)
+		return ret;
+
+	ctx->vo_config.VoDev = 0;
+	ctx->vo_config.stVoPubAttr.enIntfType = VO_INTF_MIPI;
+	ctx->vo_config.stVoPubAttr.enIntfSync = VO_OUTPUT_480x800_60;
+	ctx->vo_config.stDispRect.s32X = 0;
+	ctx->vo_config.stDispRect.s32Y = 0;
+	ctx->vo_config.stDispRect.u32Width = ctx->panel_size.u32Width;
+	ctx->vo_config.stDispRect.u32Height = ctx->panel_size.u32Height;
+	ctx->vo_config.stImageSize = ctx->panel_size;
+	ctx->vo_config.enPixFormat = PIXEL_FORMAT_NV21;
+	ctx->vo_config.enVoMode = VO_MODE_1MUX;
+	ctx->vo_config.u32DisBufLen = 3;
+
+	CHECK_RET(SAMPLE_COMM_VO_StartVO(&ctx->vo_config), "SAMPLE_COMM_VO_StartVO");
+	ctx->vo_started = CVI_TRUE;
+	if (ctx->rotate_mode == ROTATE_MODE_VO) {
+		CHECK_RET(CVI_VO_SetChnRotation(ctx->vo_config.VoDev, PLAYER_VO_CHN, requested_rotation(ctx)),
+			  "CVI_VO_SetChnRotation");
+	}
+	return CVI_SUCCESS;
+}
+
+static CVI_S32 bind_pipeline(player_ctx_t *ctx)
+{
+	CHECK_RET(SAMPLE_COMM_VPSS_Bind_VO(ctx->vpss_grp, PLAYER_VPSS_CHN,
+					   ctx->vo_config.VoDev, PLAYER_VO_CHN),
+		  "SAMPLE_COMM_VPSS_Bind_VO");
+	ctx->vpss_vo_bound = CVI_TRUE;
+	CHECK_RET(SAMPLE_COMM_VDEC_Bind_VPSS(PLAYER_VDEC_CHN, ctx->vpss_grp),
+		  "SAMPLE_COMM_VDEC_Bind_VPSS");
+	ctx->vdec_vpss_bound = CVI_TRUE;
+	return CVI_SUCCESS;
+}
+
+static CVI_S32 playback_loop_vo_bind(player_ctx_t *ctx)
+{
+	VDEC_THREAD_PARAM_S *send_param = &ctx->vdec_chn.stVdecThreadParamSend;
+	VDEC_CHN_STATUS_S status;
+	CVI_S32 ret;
+	CVI_BOOL warned_no_input = CVI_FALSE;
+
+	gettimeofday(&ctx->start_wall, NULL);
+	ctx->last_status_wall = ctx->start_wall;
+	getrusage(RUSAGE_SELF, &ctx->last_status_usage);
+	ctx->status_initialized = CVI_TRUE;
+
+	while (!g_stop_requested) {
+		ret = CVI_VDEC_QueryStatus(PLAYER_VDEC_CHN, &status);
+		if (ret != CVI_SUCCESS) {
+			SAMPLE_PRT("CVI_VDEC_QueryStatus failed with %#x\n", ret);
+			return ret;
+		}
+
+		ctx->shown_frames = status.u32DecodeStreamFrames;
+		{
+			struct timeval now;
+			double elapsed;
+
+			gettimeofday(&now, NULL);
+			elapsed = timeval_diff_sec(&now, &ctx->start_wall);
+			if (!warned_no_input && elapsed >= 2.0 &&
+			    status.u32RecvStreamFrames == 0 && status.u32DecodeStreamFrames == 0) {
+				SAMPLE_PRT("no bitstream reached VDEC after %.1fs, fileEnd=%d path=%s\n",
+					   elapsed, send_param->bFileEnd, send_param->cFileName);
+				warned_no_input = CVI_TRUE;
+			}
+			if (timeval_diff_sec(&now, &ctx->last_status_wall) >= 0.5)
+				print_status_line(ctx, &status);
+		}
+
+		if (send_param->bFileEnd &&
+		    status.u32LeftStreamBytes == 0 &&
+		    status.u32LeftStreamFrames == 0 &&
+		    status.u32LeftPics == 0) {
+			print_summary(ctx, &status);
+			return CVI_SUCCESS;
+		}
+
+		usleep(100000);
+	}
+
+	ret = CVI_VDEC_QueryStatus(PLAYER_VDEC_CHN, &status);
+	if (ret == CVI_SUCCESS) {
+		ctx->shown_frames = status.u32DecodeStreamFrames;
+		print_summary(ctx, &status);
+	}
+	return ret;
+}
+
+static CVI_S32 playback_loop_vo_sendframe(player_ctx_t *ctx)
+{
+	VDEC_THREAD_PARAM_S *send_param = &ctx->vdec_chn.stVdecThreadParamSend;
+	VIDEO_FRAME_INFO_S vdec_frame;
+	VIDEO_FRAME_INFO_S vo_frame;
+	VDEC_CHN_STATUS_S status;
+	CVI_S32 ret;
+	CVI_BOOL warned_no_input = CVI_FALSE;
+	CVI_BOOL logged_first_frame = CVI_FALSE;
+	unsigned int idle_loops = 0;
+
+	memset(&vdec_frame, 0, sizeof(vdec_frame));
+	memset(&vo_frame, 0, sizeof(vo_frame));
+	gettimeofday(&ctx->start_wall, NULL);
+	ctx->last_status_wall = ctx->start_wall;
+	getrusage(RUSAGE_SELF, &ctx->last_status_usage);
+	ctx->status_initialized = CVI_TRUE;
+
+	while (!g_stop_requested) {
+		ret = CVI_VDEC_GetFrame(PLAYER_VDEC_CHN, &vdec_frame, 1000);
+		if (ret == CVI_SUCCESS) {
+			if (!logged_first_frame) {
+				SAMPLE_PRT("first vdec frame %ux%u fmt=%d stride0=%u\n",
+					   vdec_frame.stVFrame.u32Width, vdec_frame.stVFrame.u32Height,
+					   vdec_frame.stVFrame.enPixelFormat, vdec_frame.stVFrame.u32Stride[0]);
+				logged_first_frame = CVI_TRUE;
+			}
+
+			ret = CVI_VPSS_SendFrame(ctx->vpss_grp, &vdec_frame, 1000);
+			CVI_VDEC_ReleaseFrame(PLAYER_VDEC_CHN, &vdec_frame);
+			memset(&vdec_frame, 0, sizeof(vdec_frame));
+			if (ret != CVI_SUCCESS) {
+				ctx->vpss_send_failures++;
+				SAMPLE_PRT("CVI_VPSS_SendFrame failed with %#x\n", ret);
+				continue;
+			}
+
+			ret = CVI_VPSS_GetChnFrame(ctx->vpss_grp, PLAYER_VPSS_CHN, &vo_frame, 1000);
+			if (ret != CVI_SUCCESS) {
+				ctx->vpss_get_failures++;
+				SAMPLE_PRT("CVI_VPSS_GetChnFrame failed with %#x\n", ret);
+				continue;
+			}
+
+			if (ctx->shown_frames == 0) {
+				SAMPLE_PRT("first vpss frame %ux%u fmt=%d stride0=%u\n",
+					   vo_frame.stVFrame.u32Width, vo_frame.stVFrame.u32Height,
+					   vo_frame.stVFrame.enPixelFormat, vo_frame.stVFrame.u32Stride[0]);
+			}
+
+			ret = CVI_VO_SendFrame(ctx->vo_config.VoDev, PLAYER_VO_CHN, &vo_frame, 1000);
+			if (ret != CVI_SUCCESS) {
+				SAMPLE_PRT("CVI_VO_SendFrame failed with %#x\n", ret);
+			} else {
+				ctx->shown_frames++;
+			}
+			CVI_VPSS_ReleaseChnFrame(ctx->vpss_grp, PLAYER_VPSS_CHN, &vo_frame);
+			memset(&vo_frame, 0, sizeof(vo_frame));
+
+			CHECK_RET(CVI_VDEC_QueryStatus(PLAYER_VDEC_CHN, &status), "CVI_VDEC_QueryStatus");
+			{
+				struct timeval now;
+
+				gettimeofday(&now, NULL);
+				if (timeval_diff_sec(&now, &ctx->last_status_wall) >= 0.5)
+					print_status_line(ctx, &status);
+			}
+			idle_loops = 0;
+			continue;
+		}
+
+		if (g_stop_requested)
+			break;
+
+		if (is_vdec_getframe_idle_ret(ret))
+			ctx->getframe_timeouts++;
+		else
+			SAMPLE_PRT("CVI_VDEC_GetFrame failed with %#x\n", ret);
+
+		CHECK_RET(CVI_VDEC_QueryStatus(PLAYER_VDEC_CHN, &status), "CVI_VDEC_QueryStatus");
+		{
+			struct timeval now;
+			double elapsed;
+
+			gettimeofday(&now, NULL);
+			elapsed = timeval_diff_sec(&now, &ctx->start_wall);
+			if (!warned_no_input && elapsed >= 2.0 &&
+			    status.u32RecvStreamFrames == 0 && status.u32DecodeStreamFrames == 0) {
+				SAMPLE_PRT("no bitstream reached VDEC after %.1fs, fileEnd=%d path=%s\n",
+					   elapsed, send_param->bFileEnd, send_param->cFileName);
+				warned_no_input = CVI_TRUE;
+			}
+		}
+
+		if (send_param->bFileEnd &&
+		    status.u32LeftStreamBytes == 0 &&
+		    status.u32LeftStreamFrames == 0 &&
+		    status.u32LeftPics == 0) {
+			print_summary(ctx, &status);
+			return CVI_SUCCESS;
+		}
+
+		idle_loops++;
+		if (idle_loops >= 10) {
+			print_status_line(ctx, &status);
+			idle_loops = 0;
+		}
+		if (is_vdec_getframe_idle_ret(ret))
+			usleep(5000);
+	}
+
+	CHECK_RET(CVI_VDEC_QueryStatus(PLAYER_VDEC_CHN, &status), "CVI_VDEC_QueryStatus");
+	print_summary(ctx, &status);
+	return CVI_SUCCESS;
+}
+
+static CVI_S32 playback_loop_vo(player_ctx_t *ctx)
+{
+	if (ctx->vo_path_mode == VO_PATH_MODE_BIND)
+		return playback_loop_vo_bind(ctx);
+	return playback_loop_vo_sendframe(ctx);
 }
 
 static const unsigned char *map_frame_plane0(const VIDEO_FRAME_S *vframe, CVI_BOOL *mapped)
@@ -970,7 +1616,10 @@ static CVI_S32 playback_loop(player_ctx_t *ctx)
 			continue;
 		}
 
-		if (ret == CVI_ERR_VDEC_BUSY)
+		if (g_stop_requested)
+			break;
+
+		if (is_vdec_getframe_idle_ret(ret))
 			ctx->getframe_timeouts++;
 		else
 			SAMPLE_PRT("CVI_VDEC_GetFrame failed with %#x\n", ret);
@@ -989,6 +1638,8 @@ static CVI_S32 playback_loop(player_ctx_t *ctx)
 			print_status_line(ctx, &status);
 			idle_loops = 0;
 		}
+		if (is_vdec_getframe_idle_ret(ret))
+			usleep(5000);
 	}
 
 	CHECK_RET(CVI_VDEC_QueryStatus(PLAYER_VDEC_CHN, &status), "CVI_VDEC_QueryStatus");
@@ -1000,6 +1651,17 @@ static void player_stop(player_ctx_t *ctx)
 {
 	CVI_BOOL chn_enable[VPSS_MAX_PHY_CHN_NUM] = {0};
 
+	if (ctx->vdec_vpss_bound) {
+		SAMPLE_COMM_VDEC_UnBind_VPSS(PLAYER_VDEC_CHN, ctx->vpss_grp);
+		ctx->vdec_vpss_bound = CVI_FALSE;
+	}
+
+	if (ctx->vpss_vo_bound) {
+		SAMPLE_COMM_VPSS_UnBind_VO(ctx->vpss_grp, PLAYER_VPSS_CHN,
+					    ctx->vo_config.VoDev, PLAYER_VO_CHN);
+		ctx->vpss_vo_bound = CVI_FALSE;
+	}
+
 	if (ctx->vdec_started) {
 		SAMPLE_COMM_VDEC_StopSendStream(&ctx->vdec_chn.stVdecThreadParamSend,
 						&ctx->vdec_chn.vdecThreadSend);
@@ -1010,6 +1672,11 @@ static void player_stop(player_ctx_t *ctx)
 		chn_enable[PLAYER_VPSS_CHN] = CVI_TRUE;
 		SAMPLE_COMM_VPSS_Stop(ctx->vpss_grp, chn_enable);
 		ctx->vpss_started = CVI_FALSE;
+	}
+
+	if (ctx->vo_started) {
+		SAMPLE_COMM_VO_StopVO(&ctx->vo_config);
+		ctx->vo_started = CVI_FALSE;
 	}
 
 	if (ctx->vdec_chn.bCreateChn) {
@@ -1040,7 +1707,9 @@ int main(int argc, char **argv)
 	ctx.fb.fd = -1;
 	ctx.vpss_grp = -1;
 	ctx.stage_fb.fd = -1;
-	ctx.rotate_mode = detect_rotate_mode();
+	ctx.display_backend = detect_display_backend();
+	ctx.vo_path_mode = detect_vo_path_mode();
+	ctx.rotate_mode = detect_rotate_mode(ctx.display_backend);
 	ctx.copy_mode = detect_copy_mode();
 	ctx.output_mode = detect_output_mode();
 	sanitize_rotate_mode(&ctx);
@@ -1058,22 +1727,34 @@ int main(int argc, char **argv)
 		return ret;
 	}
 
-	if (fb_open(&ctx.fb, "/dev/fb0") != 0)
-		return CVI_FAILURE;
-	sanitize_copy_mode(&ctx);
+	ctx.panel_size.u32Width = PLAYER_PANEL_WIDTH;
+	ctx.panel_size.u32Height = PLAYER_PANEL_HEIGHT;
 
-	if (ctx.rotate_mode == ROTATE_MODE_VDEC || ctx.rotate_mode == ROTATE_MODE_NONE) {
-		ctx.output_size.u32Width = ctx.fb.width;
-		ctx.output_size.u32Height = ctx.fb.height;
-	} else {
-		ctx.output_size.u32Width = ctx.fb.height;
-		ctx.output_size.u32Height = ctx.fb.width;
-	}
-	if (ctx.output_size.u32Width == 0 || ctx.output_size.u32Height == 0) {
-		if (detect_fb0_size(&ctx.output_size) != 0) {
-			SAMPLE_PRT("failed to detect framebuffer size\n");
-			player_stop(&ctx);
+	if (ctx.display_backend == DISPLAY_BACKEND_FB) {
+		if (fb_open(&ctx.fb, "/dev/fb0") != 0)
 			return CVI_FAILURE;
+		sanitize_copy_mode(&ctx);
+
+		if (ctx.rotate_mode == ROTATE_MODE_VDEC || ctx.rotate_mode == ROTATE_MODE_NONE) {
+			ctx.output_size.u32Width = ctx.fb.width;
+			ctx.output_size.u32Height = ctx.fb.height;
+		} else {
+			ctx.output_size.u32Width = ctx.fb.height;
+			ctx.output_size.u32Height = ctx.fb.width;
+		}
+		if (ctx.output_size.u32Width == 0 || ctx.output_size.u32Height == 0) {
+			if (detect_fb0_size(&ctx.output_size) != 0) {
+				SAMPLE_PRT("failed to detect framebuffer size\n");
+				player_stop(&ctx);
+				return CVI_FAILURE;
+			}
+		}
+	} else {
+		if (ctx.rotate_mode == ROTATE_MODE_VO || ctx.rotate_mode == ROTATE_MODE_VPSS) {
+			ctx.output_size.u32Width = ctx.panel_size.u32Height;
+			ctx.output_size.u32Height = ctx.panel_size.u32Width;
+		} else {
+			ctx.output_size = ctx.panel_size;
 		}
 	}
 
@@ -1082,7 +1763,8 @@ int main(int argc, char **argv)
 		player_stop(&ctx);
 		return ret;
 	}
-	if (ctx.copy_mode == COPY_MODE_TDMA || ctx.copy_mode == COPY_MODE_IVE) {
+	if (ctx.display_backend == DISPLAY_BACKEND_FB &&
+	    (ctx.copy_mode == COPY_MODE_TDMA || ctx.copy_mode == COPY_MODE_IVE)) {
 		if (ctx.copy_mode == COPY_MODE_IVE) {
 			ctx.ive_handle = CVI_IVE_CreateHandle();
 			if (ctx.ive_handle == NULL) {
@@ -1107,27 +1789,54 @@ int main(int argc, char **argv)
 		player_stop(&ctx);
 		return ret;
 	}
+	if (ctx.display_backend == DISPLAY_BACKEND_VO) {
+		ret = init_vo(&ctx);
+		if (ret != CVI_SUCCESS) {
+			player_stop(&ctx);
+			return ret;
+		}
+		if (ctx.vo_path_mode == VO_PATH_MODE_BIND) {
+			ret = bind_pipeline(&ctx);
+			if (ret != CVI_SUCCESS) {
+				player_stop(&ctx);
+				return ret;
+			}
+		}
+	}
 
 	init_send_thread_param(&ctx.vdec_chn, &ctx.vdec_chn.stVdecThreadParamSend,
 			       ctx.input_cfg.chnInCfg[0].input_path,
 			       ctx.input_cfg.chnInCfg[0].s32sendstream_timeout);
-	SAMPLE_COMM_VDEC_StartSendStream(&ctx.vdec_chn.stVdecThreadParamSend,
-					 &ctx.vdec_chn.vdecThreadSend);
+	player_start_send_stream(&ctx.vdec_chn.stVdecThreadParamSend,
+				 &ctx.vdec_chn.vdecThreadSend);
+	SAMPLE_PRT("send thread timeout=%dms thread=%lu\n",
+		   ctx.vdec_chn.stVdecThreadParamSend.s32MilliSec,
+		   (unsigned long)ctx.vdec_chn.vdecThreadSend);
 
 	signal(SIGINT, player_handle_signal);
 	signal(SIGTERM, player_handle_signal);
 	signal(SIGTSTP, player_handle_signal);
 
-	fb_clear(&ctx.fb);
-	SAMPLE_PRT("fb playback start: %s -> %ux%u fb0 (%ubpp), rotate=%s copy=%s output=%s\n",
-		   ctx.input_cfg.chnInCfg[0].input_path,
-		   ctx.output_size.u32Width, ctx.output_size.u32Height,
-		   ctx.fb.bits_per_pixel,
-		   rotate_mode_name(ctx.rotate_mode),
-		   copy_mode_name(ctx.copy_mode),
-		   output_mode_name(ctx.output_mode));
-
-	ret = playback_loop(&ctx);
+	if (ctx.display_backend == DISPLAY_BACKEND_FB) {
+		fb_clear(&ctx.fb);
+		SAMPLE_PRT("fb playback start: %s -> %ux%u fb0 (%ubpp), rotate=%s copy=%s output=%s\n",
+			   ctx.input_cfg.chnInCfg[0].input_path,
+			   ctx.output_size.u32Width, ctx.output_size.u32Height,
+			   ctx.fb.bits_per_pixel,
+			   rotate_mode_name(ctx.rotate_mode),
+			   copy_mode_name(ctx.copy_mode),
+			   output_mode_name(ctx.output_mode));
+		ret = playback_loop(&ctx);
+	} else {
+		SAMPLE_PRT("vo playback start: %s -> panel=%ux%u vpss=%ux%u backend=%s rotate=%s path=%s\n",
+			   ctx.input_cfg.chnInCfg[0].input_path,
+			   ctx.panel_size.u32Width, ctx.panel_size.u32Height,
+			   ctx.output_size.u32Width, ctx.output_size.u32Height,
+			   display_backend_name(ctx.display_backend),
+			   rotate_mode_name(ctx.rotate_mode),
+			   vo_path_mode_name(ctx.vo_path_mode));
+		ret = playback_loop_vo(&ctx);
+	}
 	player_stop(&ctx);
 	return ret;
 }
