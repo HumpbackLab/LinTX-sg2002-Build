@@ -1,0 +1,64 @@
+#!/bin/sh
+
+START_SCRIPT="/root/lintx/start.sh"
+STOP_SCRIPT="/root/lintx/scripts/board/stop_lintx.sh"
+LOG_FILE="/tmp/start_lintx.log"
+
+log() {
+	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+run_start() {
+	{
+		log "S99lintx start requested"
+		if [ ! -e "$START_SCRIPT" ]; then
+			log "ERROR: missing $START_SCRIPT"
+			exit 1
+		fi
+		if [ ! -x "$START_SCRIPT" ]; then
+			log "ERROR: $START_SCRIPT is not executable"
+			ls -l "$START_SCRIPT"
+			exit 1
+		fi
+
+		cd /root/lintx || exit 1
+		log "running $START_SCRIPT"
+		"$START_SCRIPT"
+		rc=$?
+		log "$START_SCRIPT exited with rc=$rc"
+		exit "$rc"
+	} >>"$LOG_FILE" 2>&1
+}
+
+run_stop() {
+	{
+		log "S99lintx stop requested"
+		if [ -x "$STOP_SCRIPT" ]; then
+			"$STOP_SCRIPT"
+			rc=$?
+			log "$STOP_SCRIPT exited with rc=$rc"
+			exit "$rc"
+		fi
+		log "WARN: missing or non-executable $STOP_SCRIPT"
+		exit 0
+	} >>"$LOG_FILE" 2>&1
+}
+
+case "$1" in
+	start)
+		run_start
+		;;
+	stop)
+		run_stop
+		;;
+	restart|reload)
+		run_stop
+		run_start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+
+exit $?

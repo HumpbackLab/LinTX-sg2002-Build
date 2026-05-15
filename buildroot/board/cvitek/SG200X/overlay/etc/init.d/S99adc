@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+# S99adc: control STM32 state on the S0 UART.
+
+UART_DEV="/dev/ttyS0"
+BAUD_RATE="115200"
+
+config_uart() {
+	if [ ! -e "$UART_DEV" ]; then
+		echo "Error: $UART_DEV not found!"
+		exit 1
+	fi
+
+	dmesg -n 1
+	stty -F "$UART_DEV" "$BAUD_RATE" raw -echo -isig -icanon -ixon -ixoff
+}
+
+case "$1" in
+	start)
+		echo "Configuring $UART_DEV and triggering STM32..."
+		config_uart
+		sleep 1
+		printf "start_stm" > "$UART_DEV"
+		echo "STM32 start signal sent."
+		;;
+	stop)
+		echo "Notifying STM32 to sleep..."
+		config_uart
+		printf "sleep_stm" > "$UART_DEV"
+		echo "STM32 sleep signal sent."
+		;;
+	restart|reload)
+		"$0" stop
+		"$0" start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+
+exit $?
